@@ -996,23 +996,11 @@ end)
 vim.keymap.set('n', '<C-t>', function()
   harpoon:list():select(1)
 end)
-vim.keymap.set('n', '<C-n>', function()
-  harpoon:list():select(2)
-end)
-vim.keymap.set('n', '<C-s>', function()
-  harpoon:list():select(3)
-end)
 
--- Toggle previous & next buffers stored within Harpoon list
-vim.keymap.set('n', '<C-S-P>', function()
-  harpoon:list():prev()
-end)
-vim.keymap.set('n', '<C-S-N>', function()
-  harpoon:list():next()
-end)
+vim.keymap.set('n', '<C-m>', '<cmd>b#<CR>', { desc = 'Last buffer' })
+vim.keymap.set('n', '<C-n>', '<cmd>bprev<CR>', { desc = 'Last buffer' })
 
-local harpoon = require 'harpoon'
-harpoon:setup {}
+local recent_index = nil
 
 -- basic telescope configuration
 local conf = require('telescope.config').values
