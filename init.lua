@@ -644,6 +644,14 @@ require('lazy').setup({
             },
           },
         },
+
+        eslint = {
+          settings = {
+            -- helps eslint find the eslintrc when it's placed in a subfolder instead of the cwd root
+            workingDirectories = { mode = 'auto' },
+            format_on_save = true,
+          },
+        },
       }
 
       -- Ensure the servers and tools above are installed
@@ -996,6 +1004,10 @@ end)
 vim.keymap.set('n', '<C-t>', function()
   harpoon:list():select(1)
 end)
+
+vim.keymap.set('n', '<leader>hc', function()
+  harpoon:list():clear()
+end, { desc = 'Clear all Harpoon marks' })
 
 vim.keymap.set('n', '<C-m>', '<cmd>b#<CR>', { desc = 'Last buffer' })
 vim.keymap.set('n', '<C-n>', '<cmd>bprev<CR>', { desc = 'Last buffer' })
