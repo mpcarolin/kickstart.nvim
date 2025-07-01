@@ -47,6 +47,7 @@ vim.opt.number = true
 -- You can also add relative line numbers, to help with jumping.
 --  Experiment for yourself to see if you like it!
 vim.opt.relativenumber = true
+vim.o.conceallevel = 1 -- needed for Obsidian proper formatting
 
 -- Tab sizes
 vim.opt.tabstop = 2
@@ -616,7 +617,7 @@ require('lazy').setup({
       local servers = {
         -- clangd = {},
         gopls = {},
-        -- pyright = {},
+        pyright = {},
         -- rust_analyzer = {},
         -- ... etc. See `:help lspconfig-all` for a list of all the pre-configured LSPs
         --
@@ -941,6 +942,7 @@ require('lazy').setup({
   },
 
   -- harpoon: replacement for buffer navigation ("tabs" in a tool like vscode). Keep 3-4 buffers in easy access, linked by marks.
+  -- TODO: should we move this to custom plugin file?
   {
     'ThePrimeagen/harpoon',
     branch = 'harpoon2',
