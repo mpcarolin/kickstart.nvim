@@ -133,6 +133,71 @@ vim.keymap.set('t', '<Esc><Esc>', '<C-\\><C-n>', { desc = 'Exit terminal mode' }
 -- NeoTree :help neo-tree
 vim.keymap.set('n', '<C-a>', '<Cmd>Neotree reveal toggle<CR>')
 
+-- Yank relative file path with line number range (visual mode)
+vim.keymap.set('v', '<leader>y', function()
+  local start_line = vim.fn.line('v')
+  local end_line = vim.fn.line('.')
+  if start_line > end_line then
+    start_line, end_line = end_line, start_line
+  end
+
+  local file_path = vim.fn.expand('%:.')
+  local result = string.format('./%s:%d-%d', file_path, start_line, end_line)
+
+  vim.fn.setreg('+', result)
+  vim.fn.setreg('"', result)
+
+  print('Yanked: ' .. result)
+end, { desc = '[Y]ank relative file path with line range' })
+
+-- Yank relative file path (normal mode)
+vim.keymap.set('n', '<leader>y', function()
+  local file_path = vim.fn.expand('%:.')
+  local result = './' .. file_path
+
+  vim.fn.setreg('+', result)
+  vim.fn.setreg('"', result)
+
+  print('Yanked: ' .. result)
+end, { desc = '[Y]ank relative file path' })
+
+-- Open scratch notes file
+vim.keymap.set('n', '<leader>ii', function()
+  vim.cmd('edit ~/Development/notes/scratch.md')
+end, { desc = 'Open scratch notes' })
+
+-- Toggle terminal in vertical split
+local terminal_bufnr = nil
+local terminal_winnr = nil
+vim.keymap.set('n', '<leader>tt', function()
+  -- Check if we have a terminal buffer that still exists
+  if terminal_bufnr and vim.api.nvim_buf_is_valid(terminal_bufnr) then
+    -- Check if terminal is currently visible
+    local win_found = false
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(win) == terminal_bufnr then
+        -- Terminal is visible, hide it
+        vim.api.nvim_win_hide(win)
+        win_found = true
+        break
+      end
+    end
+
+    -- If terminal wasn't visible, show it again
+    if not win_found then
+      vim.cmd 'vsplit'
+      vim.api.nvim_win_set_buf(0, terminal_bufnr)
+      vim.cmd 'startinsert'
+    end
+  else
+    -- No terminal buffer exists, create a new one
+    vim.cmd 'vsplit'
+    vim.cmd 'term'
+    terminal_bufnr = vim.api.nvim_get_current_buf()
+    vim.cmd 'startinsert'
+  end
+end, { desc = '[T]oggle [T]erminal' })
+
 -- TIP: Disable arrow keys in normal mode
 -- vim.keymap.set('n', '<left>', '<cmd>echo "Use h to move!!"<CR>')
 -- vim.keymap.set('n', '<right>', '<cmd>echo "Use l to move!!"<CR>')
@@ -346,6 +411,15 @@ require('lazy').setup({
       -- This opens a window that shows you all of the keymaps for the current
       -- Telescope picker. This is really useful to discover what Telescope can
       -- do as well as how to actually do it!
+      --
+      --
+      require('neotest').setup {
+        adapters = {
+          require 'neotest-vitest' {
+            vitestCommand = 'cd /Users/michaelcarolin/Development/ragorama/repos/prism && pnpm test',
+          },
+        },
+      }
 
       -- [[ Configure Telescope ]]
       -- See `:help telescope` and `:help telescope.setup()`
@@ -353,11 +427,16 @@ require('lazy').setup({
         -- You can put your default mappings / updates / etc. in here
         --  All the info you're looking for is in `:help telescope.setup()`
         --
-        -- defaults = {
-        --   mappings = {
-        --     i = { ['<c-enter>'] = 'to_fuzzy_refine' },
-        --   },
-        -- },
+        defaults = {
+          mappings = {
+            i = {
+              ['<C-q>'] = require('telescope.actions').smart_send_to_qflist + require('telescope.actions').open_qflist,
+            },
+            n = {
+              ['<C-q>'] = require('telescope.actions').smart_send_to_qflist + require('telescope.actions').open_qflist,
+            },
+          },
+        },
         -- pickers = {}
         extensions = {
           ['ui-select'] = {
@@ -849,7 +928,7 @@ require('lazy').setup({
       -- Load the colorscheme here.
       -- Like many other themes, this one has different styles, and you could load
       -- any other, such as 'tokyonight-storm', 'tokyonight-moon', or 'tokyonight-day'.
-      vim.cmd.colorscheme 'tokyonight-night'
+      vim.cmd.colorscheme 'tokyonight-moon'
     end,
   },
 
@@ -944,6 +1023,9 @@ require('lazy').setup({
       'MunifTanjim/nui.nvim',
       -- {"3rd/image.nvim", opts = {}}, -- Optional image support in preview window: See `# Preview Mode` for more information
     },
+    init = function()
+      -- do nothing so it doesn't appear on boot
+    end,
     lazy = false, -- neo-tree will lazily load itself
     ---@module "neo-tree"
     ---@type neotree.Config?
@@ -1002,9 +1084,20 @@ harpoon:setup()
 vim.keymap.set('n', '<leader>a', function()
   harpoon:list():add()
 end)
+vim.keymap.set('n', '<leader>m', function()
+  harpoon.ui:toggle_quick_menu(harpoon:list())
+end)
 
 vim.keymap.set('n', '<C-t>', function()
   harpoon:list():select(1)
+end)
+
+-- Toggle previous & next buffers stored within Harpoon list
+vim.keymap.set('n', '<C-S-P>', function()
+  harpoon:list():prev()
+end)
+vim.keymap.set('n', '<C-S-N>', function()
+  harpoon:list():next()
 end)
 
 vim.keymap.set('n', '<leader>hc', function()
@@ -1039,6 +1132,14 @@ end
 vim.keymap.set('n', '<C-e>', function()
   toggle_telescope(harpoon:list())
 end, { desc = 'Open harpoon window' })
+
+local prefix = vim.env.XDG_CONFIG_HOME or vim.fn.expand '~/.config'
+
+vim.opt.undodir = { prefix .. '/nvim/.undo//' }
+
+vim.opt.backupdir = { prefix .. '/nvim/.backup//' }
+
+vim.opt.directory = { prefix .. '/nvim/.swp//' }
 
 -- The line beneath this is called `modeline`. See `:help modeline`
 -- vim: ts=2 sts=2 sw=2 et
