@@ -5,6 +5,7 @@ return {
   },
   config = function()
     require('claude-code').setup {
+      command = 'claude',
       window = {
         position = 'vertical',
         split_ratio = 0.3,
