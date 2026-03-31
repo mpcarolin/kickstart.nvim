@@ -135,13 +135,13 @@ vim.keymap.set('n', '<C-a>', '<Cmd>Neotree reveal toggle<CR>')
 
 -- Yank relative file path with line number range (visual mode)
 vim.keymap.set('v', '<leader>y', function()
-  local start_line = vim.fn.line('v')
-  local end_line = vim.fn.line('.')
+  local start_line = vim.fn.line 'v'
+  local end_line = vim.fn.line '.'
   if start_line > end_line then
     start_line, end_line = end_line, start_line
   end
 
-  local file_path = vim.fn.expand('%:.')
+  local file_path = vim.fn.expand '%:.'
   local result = string.format('./%s:%d-%d', file_path, start_line, end_line)
 
   vim.fn.setreg('+', result)
@@ -152,7 +152,7 @@ end, { desc = '[Y]ank relative file path with line range' })
 
 -- Yank relative file path (normal mode)
 vim.keymap.set('n', '<leader>y', function()
-  local file_path = vim.fn.expand('%:.')
+  local file_path = vim.fn.expand '%:.'
   local result = './' .. file_path
 
   vim.fn.setreg('+', result)
@@ -163,7 +163,7 @@ end, { desc = '[Y]ank relative file path' })
 
 -- Open scratch notes file
 vim.keymap.set('n', '<leader>ii', function()
-  vim.cmd('edit ~/Development/notes/scratch.md')
+  vim.cmd 'edit ~/Development/notes/scratch.md'
 end, { desc = 'Open scratch notes' })
 
 -- Toggle terminal in vertical split
@@ -428,6 +428,9 @@ require('lazy').setup({
         --  All the info you're looking for is in `:help telescope.setup()`
         --
         defaults = {
+          file_ignore_patterns = {
+            '%-agent%d+/',
+          },
           mappings = {
             i = {
               ['<C-q>'] = require('telescope.actions').smart_send_to_qflist + require('telescope.actions').open_qflist,
