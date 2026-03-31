@@ -466,6 +466,163 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>s.', builtin.oldfiles, { desc = '[S]earch Recent Files ("." for repeat)' })
       vim.keymap.set('n', '<leader><leader>', builtin.buffers, { desc = '[ ] Find existing buffers' })
 
+      -- Git branches sorted by most recent commit, using the current buffer's repo
+      vim.keymap.set('n', '<C-g>', function()
+        local pickers = require 'telescope.pickers'
+        local finders = require 'telescope.finders'
+        local previewers = require 'telescope.previewers'
+        local conf = require('telescope.config').values
+        local actions = require 'telescope.actions'
+        local action_state = require 'telescope.actions.state'
+        local buf_dir = vim.fn.expand '%:p:h'
+
+        local cutoff = os.time() - (14 * 24 * 60 * 60)
+        local current_branch = vim.fn.system({ 'git', '-C', buf_dir, 'branch', '--show-current' }):gsub('%s+', '')
+        local output = vim.fn.system {
+          'git', '-C', buf_dir, 'for-each-ref', 'refs/heads/',
+          '--sort=-committerdate', '--format=%(refname:short)\t%(committerdate:unix)\t%(committerdate:relative)',
+        }
+        local branches = {}
+        local current_entry = nil
+        for line in output:gmatch '[^\n]+' do
+          local name, ts, date = line:match '(.+)\t(%d+)\t(.+)'
+          if name then
+            local entry = {
+              name = name,
+              date = date,
+              stale = tonumber(ts) < cutoff,
+              prefix = name == current_branch and '* ' or '  ',
+            }
+            if name == current_branch then
+              current_entry = entry
+            else
+              table.insert(branches, entry)
+            end
+          end
+        end
+        if current_entry then
+          table.insert(branches, 1, current_entry)
+        end
+
+        pickers
+          .new({}, {
+            prompt_title = 'Git Branches',
+            finder = finders.new_table {
+              results = branches,
+              entry_maker = function(entry)
+                local displayer = require('telescope.pickers.entry_display').create {
+                  separator = ' ',
+                  items = {
+                    { width = 2 },
+                    { remaining = true },
+                    { width = 20 },
+                  },
+                }
+                local dim = 'TelescopeResultsComment'
+                return {
+                  value = entry.name,
+                  display = function()
+                    return displayer {
+                      entry.prefix,
+                      { entry.name, entry.stale and dim or nil },
+                      { entry.date, dim },
+                    }
+                  end,
+                  ordinal = entry.name,
+                }
+              end,
+            },
+            sorter = conf.generic_sorter {},
+            previewer = previewers.new_buffer_previewer {
+              title = 'Git Log',
+              get_buffer_by_name = function(_, entry)
+                return entry.value
+              end,
+              define_preview = function(self, entry)
+                local branch = entry.value
+                -- Detect default branch (origin/main or origin/master)
+                local base = 'origin/main'
+                if vim.fn.system({ 'git', '-C', buf_dir, 'rev-parse', '--verify', 'origin/main' }):find 'fatal' then
+                  base = 'origin/master'
+                end
+
+                -- Author and date of latest commit
+                local info = vim.fn.system({ 'git', '-C', buf_dir, 'log', '-1', '--format=%an\t%cr', branch }):gsub('\n', '')
+                local author, date = info:match '(.+)\t(.+)'
+                author = author or 'unknown'
+                date = date or 'unknown'
+
+                -- Ahead/behind vs base branch
+                local counts = vim.fn.system({ 'git', '-C', buf_dir, 'rev-list', '--left-right', '--count', base .. '...' .. branch }):gsub('\n', '')
+                local behind, ahead = counts:match '(%d+)%s+(%d+)'
+                behind = behind or '?'
+                ahead = ahead or '?'
+
+                -- Total commits since diverging from base
+                local commit_count = vim.fn.system({ 'git', '-C', buf_dir, 'rev-list', '--count', base .. '..' .. branch }):gsub('%s+', '')
+
+                -- Build header
+                local sep = string.rep('─', 40)
+                local header = {
+                  'Branch:   ' .. branch,
+                  'Author:   ' .. author,
+                  'Date:     ' .. date,
+                  'Commits:  ' .. commit_count .. ' since ' .. base,
+                  'Ahead:    ' .. ahead .. '  |  Behind: ' .. behind,
+                  sep,
+                  '',
+                }
+
+                -- Git log graph
+                local log = vim.fn.systemlist {
+                  'git', '-C', buf_dir, 'log', '--oneline', '--graph', '-20', branch,
+                }
+                for _, line in ipairs(log) do
+                  table.insert(header, line)
+                end
+
+                vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, header)
+
+                -- Highlight the header
+                local buf = self.state.bufnr
+                local hl = vim.api.nvim_buf_add_highlight
+                local label_len = 10 -- length of "Branch:   " etc.
+                -- Line 0: Branch
+                hl(buf, 0, 'Comment', 0, 0, label_len)
+                hl(buf, 0, 'Function', 0, label_len, -1)
+                -- Line 1: Author
+                hl(buf, 0, 'Comment', 1, 0, label_len)
+                hl(buf, 0, 'String', 1, label_len, -1)
+                -- Line 2: Date
+                hl(buf, 0, 'Comment', 2, 0, label_len)
+                hl(buf, 0, 'Number', 2, label_len, -1)
+                -- Line 3: Commits
+                hl(buf, 0, 'Comment', 3, 0, label_len)
+                hl(buf, 0, 'Number', 3, label_len, -1)
+                -- Line 4: Ahead/Behind
+                hl(buf, 0, 'Comment', 4, 0, label_len)
+                hl(buf, 0, 'DiagnosticOk', 4, label_len, label_len + #ahead)
+                hl(buf, 0, 'Comment', 4, label_len + #ahead, label_len + #ahead + 5)
+                hl(buf, 0, 'DiagnosticWarn', 4, label_len + #ahead + 5, -1)
+                -- Line 5: Separator
+                hl(buf, 0, 'Comment', 5, 0, -1)
+              end,
+            },
+            attach_mappings = function(prompt_bufnr)
+              actions.select_default:replace(function()
+                local selection = action_state.get_selected_entry()
+                actions.close(prompt_bufnr)
+                if selection then
+                  vim.fn.system { 'git', '-C', buf_dir, 'checkout', selection.value }
+                  vim.cmd 'checktime'
+                end
+              end)
+              return true
+            end,
+          })
+          :find()
+      end, { desc = 'Git branches (recent first)' })
+
       -- Slightly advanced example of overriding default behavior and theme
       vim.keymap.set('n', '<leader>/', function()
         -- You can pass additional configuration to Telescope to change the theme, layout, etc.
