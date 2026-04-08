@@ -613,8 +613,12 @@ require('lazy').setup({
                 local selection = action_state.get_selected_entry()
                 actions.close(prompt_bufnr)
                 if selection then
-                  vim.fn.system { 'git', '-C', buf_dir, 'checkout', selection.value }
-                  vim.cmd 'checktime'
+                  local output = vim.fn.system { 'git', '-C', buf_dir, 'checkout', selection.value }
+                  if vim.v.shell_error ~= 0 then
+                    vim.notify(output, vim.log.levels.ERROR, { title = 'Git checkout' })
+                  else
+                    vim.cmd 'checktime'
+                  end
                 end
               end)
               return true
