@@ -26,6 +26,7 @@
   "nvim-httpyac": { "branch": "main", "commit": "057c2b909892020df2f6d1593ee198a64a9cf778" },
   "nvim-lspconfig": { "branch": "master", "commit": "4bc481b6f0c0cf3671fc894debd0e00347089a4e" },
   "nvim-nio": { "branch": "master", "commit": "21f5324bfac14e22ba26553caf69ec76ae8a7662" },
+  "nvim-notify": { "branch": "master", "commit": "8701bece920b38ea289b457f902e2ad184131a5d" },
   "nvim-treesitter": { "branch": "master", "commit": "94ea4f436d2b59c80f02e293466c374584f03b8c" },
   "nvim-ufo": { "branch": "main", "commit": "72d54c31079d38d8dfc5456131b1d0fb5c0264b0" },
   "plenary.nvim": { "branch": "master", "commit": "857c5ac632080dba10aae49dba902ce3abf91b35" },
