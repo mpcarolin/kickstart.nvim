@@ -1175,28 +1175,8 @@ require('lazy').setup({
   -- require 'kickstart.plugins.indent_line',
   -- require 'kickstart.plugins.lint',
   -- require 'kickstart.plugins.autopairs',
-  --  require 'kickstart.plugins.neo-tree',
+  -- neo-tree lives in lua/custom/plugins/neo-tree.lua
   require 'kickstart.plugins.gitsigns', -- adds gitsigns recommend keymaps
-  --
-  {
-    'nvim-neo-tree/neo-tree.nvim',
-    branch = 'v3.x',
-    dependencies = {
-      'nvim-lua/plenary.nvim',
-      'nvim-tree/nvim-web-devicons', -- not strictly required, but recommended
-      'MunifTanjim/nui.nvim',
-      -- {"3rd/image.nvim", opts = {}}, -- Optional image support in preview window: See `# Preview Mode` for more information
-    },
-    init = function()
-      -- do nothing so it doesn't appear on boot
-    end,
-    lazy = false, -- neo-tree will lazily load itself
-    ---@module "neo-tree"
-    ---@type neotree.Config?
-    opts = {
-      -- fill any relevant options here
-    },
-  },
 
   -- harpoon: replacement for buffer navigation ("tabs" in a tool like vscode). Keep 3-4 buffers in easy access, linked by marks.
   -- TODO: should we move this to custom plugin file?
