@@ -474,7 +474,8 @@ require('lazy').setup({
         local conf = require('telescope.config').values
         local actions = require 'telescope.actions'
         local action_state = require 'telescope.actions.state'
-        local buf_dir = vim.fn.expand '%:p:h'
+        local buf_name = vim.api.nvim_buf_get_name(0)
+        local buf_dir = buf_name ~= '' and vim.fn.fnamemodify(buf_name, ':p:h') or vim.fn.getcwd()
 
         local cutoff = os.time() - (14 * 24 * 60 * 60)
         local current_branch = vim.fn.system({ 'git', '-C', buf_dir, 'branch', '--show-current' }):gsub('%s+', '')
