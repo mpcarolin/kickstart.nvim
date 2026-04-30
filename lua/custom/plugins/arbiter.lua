@@ -11,6 +11,30 @@
 -- diffview, neogit) are not supported for the diff-mapping path; in those
 -- buffers arbiter falls back to the regular-buffer behavior (filename + raw
 -- line numbers, no commit SHA).
+--
+-- Each record carries a `branch` field (resolved at write-time). On detached
+-- HEAD the short SHA is stored as the branch. Commands:
+--   :Arbiter        leave a note on the current line/selection (<leader>gr)
+--   :ArbiterShow    load current branch's notes into the quickfix list
+--   :ArbiterClear[!] clear notes for the current branch (<leader>gR, prompts)
+--   :ArbiterSigns {enable|disable|toggle}  toggle inline diagnostics
+--   :ArbiterStatus {pending|in-progress|needs-rereview}  set status of note under cursor (<leader>gs)
+-- Inline diagnostics (severity varies by status) display notes on their
+-- target lines for the current branch only. Records without a `branch` field
+-- (older entries) match every branch for back-compat.
+--
+-- Record schema (one JSON object per line in <repo>/.git/arbiter.jsonl):
+--   file:        repo-relative path
+--   line_start:  1-indexed start line in the post-image
+--   line_end:    1-indexed end line
+--   commit:      short SHA when set from a fugitive diff buffer (else null)
+--   branch:      branch name, or short SHA on detached HEAD (null on error)
+--   note:        free-text review comment (markdown ok)
+--   created_at:  ISO-8601 timestamp with offset
+--   status:      "pending" (default on write) | "in-progress" | "needs-rereview"
+-- An AI assistant addressing a note should rewrite the matching record's
+-- `status` field (identify by file + line_start + branch + created_at).
+-- Records missing `status` are treated as "pending" for back-compat.
 
 return {
   dir = vim.fn.stdpath 'config' .. '/lua/custom/local-plugins/arbiter',
@@ -31,6 +55,196 @@ return {
       local git_dir = found[1]
       local repo_root = vim.fs.dirname(git_dir)
       return repo_root, git_dir
+    end
+
+    -- Resolve the current branch for a given git_dir. Returns string|nil.
+    -- On detached HEAD (rev-parse --abbrev-ref returns "HEAD") falls back to
+    -- the short SHA so records can still be partitioned per-checkout.
+    local function current_branch(git_dir)
+      if not git_dir or git_dir == '' then
+        return nil
+      end
+      local out = vim.fn.system { 'git', '--git-dir=' .. git_dir, 'rev-parse', '--abbrev-ref', 'HEAD' }
+      if vim.v.shell_error ~= 0 then
+        return nil
+      end
+      local name = (out or ''):gsub('%s+$', '')
+      if name == '' then
+        return nil
+      end
+      if name == 'HEAD' then
+        local sha_out = vim.fn.system { 'git', '--git-dir=' .. git_dir, 'rev-parse', '--short=12', 'HEAD' }
+        if vim.v.shell_error ~= 0 then
+          return nil
+        end
+        local sha = (sha_out or ''):gsub('%s+$', '')
+        if sha == '' then
+          return nil
+        end
+        return sha
+      end
+      return name
+    end
+
+    -- Resolve (jsonl_path, repo_root, git_dir, err). Tries fugitive first,
+    -- falls back to .git discovery from cwd. err is a string when something
+    -- failed; jsonl_path is otherwise <git_dir>/arbiter.jsonl.
+    local function resolve_paths()
+      local repo_root, git_dir
+      local ok, repo = pcall(vim.fn.FugitiveGitDir)
+      if ok and type(repo) == 'string' and repo ~= '' then
+        git_dir = repo
+        repo_root = vim.fs.dirname(repo)
+      else
+        repo_root, git_dir = find_git_root(vim.fn.getcwd())
+      end
+      if not repo_root or not git_dir then
+        return nil, nil, nil, 'not inside a git repo'
+      end
+      return git_dir .. '/arbiter.jsonl', repo_root, git_dir, nil
+    end
+
+    -- Read a JSONL file line-by-line. Malformed lines are silently skipped so
+    -- one bad entry doesn't break show/clear. Missing file → {}.
+    local function read_jsonl(path)
+      local f = io.open(path, 'r')
+      if not f then
+        return {}
+      end
+      local records = {}
+      for line in f:lines() do
+        if line ~= '' then
+          local ok, decoded = pcall(vim.json.decode, line)
+          if ok and type(decoded) == 'table' then
+            table.insert(records, decoded)
+          end
+        end
+      end
+      f:close()
+      return records
+    end
+
+    -- Keep records whose branch matches `branch`, or that have no branch
+    -- (back-compat with pre-tagging entries). When `branch` is nil, return
+    -- everything.
+    local function filter_for_branch(records, branch)
+      if not branch then
+        return records
+      end
+      local out = {}
+      for _, r in ipairs(records) do
+        if r.branch == nil or r.branch == vim.NIL or r.branch == branch then
+          table.insert(out, r)
+        end
+      end
+      return out
+    end
+
+    local STATUSES = { 'pending', 'in-progress', 'needs-rereview' }
+
+    local function normalize_status(s)
+      if s == nil or s == vim.NIL or s == '' then
+        return 'pending'
+      end
+      for _, v in ipairs(STATUSES) do
+        if v == s then
+          return s
+        end
+      end
+      return 'pending'
+    end
+
+    local STATUS_SEVERITY = {
+      ['pending'] = vim.diagnostic.severity.HINT,
+      ['in-progress'] = vim.diagnostic.severity.INFO,
+      ['needs-rereview'] = vim.diagnostic.severity.WARN,
+    }
+
+    local STATUS_QF_TYPE = {
+      ['pending'] = 'I',
+      ['in-progress'] = 'W',
+      ['needs-rereview'] = 'E',
+    }
+
+    -- Atomic rewrite via tmp + rename inside .git/.
+    local function rewrite_jsonl(path, records)
+      local tmp = path .. '.tmp'
+      local f, err = io.open(tmp, 'w')
+      if not f then
+        return false, err
+      end
+      for _, r in ipairs(records) do
+        local ok, encoded = pcall(vim.json.encode, r)
+        if ok then
+          f:write(encoded .. '\n')
+        end
+      end
+      f:close()
+      local ok, rename_err = os.rename(tmp, path)
+      if not ok then
+        return false, rename_err
+      end
+      return true
+    end
+
+    local diag_ns = vim.api.nvim_create_namespace 'arbiter'
+    if vim.g.arbiter_signs_enabled == nil then
+      vim.g.arbiter_signs_enabled = true
+    end
+
+    -- Refresh diagnostics for one buffer based on the JSONL + current branch.
+    local function refresh_diagnostics_for_buf(bufnr)
+      if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+      end
+      if not vim.g.arbiter_signs_enabled then
+        return
+      end
+      local bufname = vim.api.nvim_buf_get_name(bufnr)
+      if bufname == '' then
+        return
+      end
+      if vim.bo[bufnr].buftype ~= '' then
+        return
+      end
+      local repo_root, git_dir = find_git_root(bufname)
+      if not repo_root or not git_dir then
+        return
+      end
+      local jsonl_path = git_dir .. '/arbiter.jsonl'
+      local abs = vim.fn.fnamemodify(bufname, ':p')
+      local root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
+      if abs:sub(1, #root_abs + 1) ~= root_abs .. '/' then
+        return
+      end
+      local rel = abs:sub(#root_abs + 2)
+      local branch = current_branch(git_dir)
+      local records = filter_for_branch(read_jsonl(jsonl_path), branch)
+      local diagnostics = {}
+      for _, r in ipairs(records) do
+        if r.file == rel and type(r.line_start) == 'number' and type(r.line_end) == 'number' then
+          local lnum = math.max(0, r.line_start - 1)
+          local end_lnum = math.max(lnum, r.line_end - 1)
+          local status = normalize_status(r.status)
+          table.insert(diagnostics, {
+            lnum = lnum,
+            end_lnum = end_lnum,
+            col = 0,
+            severity = STATUS_SEVERITY[status],
+            source = 'arbiter',
+            message = '[' .. status .. '] ' .. tostring(r.note or ''),
+          })
+        end
+      end
+      vim.diagnostic.set(diag_ns, bufnr, diagnostics)
+    end
+
+    local function refresh_all_listed_buffers()
+      for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buflisted then
+          refresh_diagnostics_for_buf(bufnr)
+        end
+      end
     end
 
     -- Resolve a fugitive buffer's rev to a short SHA.
@@ -283,6 +497,7 @@ return {
 
     function M.add_comment(start_line, end_line)
       local bufnr = vim.api.nvim_get_current_buf()
+      local source_bufnr = bufnr
       local bufname = vim.api.nvim_buf_get_name(bufnr)
       local is_fugitive_diff = vim.bo[bufnr].filetype == 'git'
 
@@ -354,6 +569,7 @@ return {
       }
 
       local jsonl_path = git_dir .. '/arbiter.jsonl'
+      local branch = current_branch(git_dir)
 
       open_note_window(meta, function(note)
         local record = {
@@ -361,11 +577,16 @@ return {
           line_start = meta.line_start,
           line_end = meta.line_end,
           commit = meta.commit, -- nil → omitted by vim.json.encode
+          branch = branch,
           note = note,
           created_at = iso8601_now(),
+          status = 'pending',
         }
         if record.commit == nil then
           record.commit = vim.NIL
+        end
+        if record.branch == nil then
+          record.branch = vim.NIL
         end
         local ok, err = append_jsonl(jsonl_path, record)
         if not ok then
@@ -382,6 +603,172 @@ return {
           ),
           vim.log.levels.INFO
         )
+        -- Refresh diagnostics on the source buffer so the new note shows up
+        -- immediately (regular-buffer flow). Fugitive diff buffers have no
+        -- working-tree file behind them, so the refresh is a no-op there.
+        if vim.api.nvim_buf_is_valid(source_bufnr) then
+          refresh_diagnostics_for_buf(source_bufnr)
+        end
+      end)
+    end
+
+    function M.show()
+      local jsonl_path, repo_root, git_dir, err = resolve_paths()
+      if err then
+        vim.notify('arbiter: ' .. err, vim.log.levels.ERROR)
+        return
+      end
+      local branch = current_branch(git_dir)
+      local records = filter_for_branch(read_jsonl(jsonl_path), branch)
+      if #records == 0 then
+        vim.notify('arbiter: no notes for ' .. (branch or '<unknown>'), vim.log.levels.INFO)
+        return
+      end
+      local items = {}
+      for _, r in ipairs(records) do
+        if r.file and type(r.line_start) == 'number' then
+          local note = tostring(r.note or '')
+          local first_nl = note:find '\n'
+          local preview
+          if first_nl then
+            preview = note:sub(1, first_nl - 1) .. ' …'
+          else
+            preview = note
+          end
+          local status = normalize_status(r.status)
+          table.insert(items, {
+            filename = repo_root .. '/' .. r.file,
+            lnum = r.line_start,
+            end_lnum = type(r.line_end) == 'number' and r.line_end or r.line_start,
+            text = '[' .. status .. '] ' .. preview,
+            type = STATUS_QF_TYPE[status],
+          })
+        end
+      end
+      vim.fn.setqflist({}, ' ', {
+        title = 'arbiter notes (' .. (branch or '<unknown>') .. ')',
+        items = items,
+      })
+      vim.cmd 'copen'
+    end
+
+    function M.clear(opts)
+      opts = opts or {}
+      local jsonl_path, _, git_dir, err = resolve_paths()
+      if err then
+        vim.notify('arbiter: ' .. err, vim.log.levels.ERROR)
+        return
+      end
+      local branch = current_branch(git_dir)
+      if not branch then
+        vim.notify('arbiter: could not resolve current branch', vim.log.levels.ERROR)
+        return
+      end
+      -- Untagged (back-compat) records match any branch, so a clear on the
+      -- current branch sweeps them too.
+      local all = read_jsonl(jsonl_path)
+      local kept, mine = {}, {}
+      for _, r in ipairs(all) do
+        if r.branch == nil or r.branch == vim.NIL or r.branch == branch then
+          table.insert(mine, r)
+        else
+          table.insert(kept, r)
+        end
+      end
+      if #mine == 0 then
+        vim.notify('arbiter: nothing to clear for ' .. branch, vim.log.levels.INFO)
+        return
+      end
+
+      local function do_clear()
+        local ok, rerr = rewrite_jsonl(jsonl_path, kept)
+        if not ok then
+          vim.notify('arbiter: clear failed: ' .. tostring(rerr), vim.log.levels.ERROR)
+          return
+        end
+        vim.diagnostic.reset(diag_ns)
+        refresh_all_listed_buffers()
+        vim.notify(
+          string.format('arbiter: cleared %d notes for %s', #mine, branch),
+          vim.log.levels.INFO
+        )
+      end
+
+      if opts.bang then
+        do_clear()
+        return
+      end
+
+      vim.ui.select({ 'no', 'yes' }, {
+        prompt = string.format('Clear %d notes for branch %s?', #mine, branch),
+      }, function(choice)
+        if choice == 'yes' then
+          do_clear()
+        end
+      end)
+    end
+
+    -- Find the record covering the cursor in the current buffer (current
+    -- branch, file matches buffer, line range covers cursor line). Returns
+    -- (records, index) into the original on-disk array, or nil.
+    local function find_record_at_cursor()
+      local bufnr = vim.api.nvim_get_current_buf()
+      local bufname = vim.api.nvim_buf_get_name(bufnr)
+      if bufname == '' then
+        return nil, nil, nil, 'buffer has no filename'
+      end
+      local repo_root, git_dir = find_git_root(bufname)
+      if not repo_root or not git_dir then
+        return nil, nil, nil, 'not inside a git repo'
+      end
+      local jsonl_path = git_dir .. '/arbiter.jsonl'
+      local abs = vim.fn.fnamemodify(bufname, ':p')
+      local root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
+      if abs:sub(1, #root_abs + 1) ~= root_abs .. '/' then
+        return nil, nil, nil, 'file is outside repo'
+      end
+      local rel = abs:sub(#root_abs + 2)
+      local branch = current_branch(git_dir)
+      local cursor_lnum = vim.fn.line '.'
+      local all = read_jsonl(jsonl_path)
+      for i, r in ipairs(all) do
+        local matches_branch = r.branch == nil or r.branch == vim.NIL or r.branch == branch
+        if
+          matches_branch
+          and r.file == rel
+          and type(r.line_start) == 'number'
+          and type(r.line_end) == 'number'
+          and cursor_lnum >= r.line_start
+          and cursor_lnum <= r.line_end
+        then
+          return all, i, jsonl_path, nil
+        end
+      end
+      return nil, nil, nil, 'no arbiter note on this line'
+    end
+
+    function M.set_status(status)
+      status = normalize_status(status)
+      local all, idx, jsonl_path, err = find_record_at_cursor()
+      if err then
+        vim.notify('arbiter: ' .. err, vim.log.levels.WARN)
+        return
+      end
+      all[idx].status = status
+      local ok, werr = rewrite_jsonl(jsonl_path, all)
+      if not ok then
+        vim.notify('arbiter: status write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+        return
+      end
+      refresh_diagnostics_for_buf(vim.api.nvim_get_current_buf())
+      vim.notify('arbiter: status → ' .. status, vim.log.levels.INFO)
+    end
+
+    function M.pick_status()
+      vim.ui.select(STATUSES, { prompt = 'arbiter status:' }, function(choice)
+        if choice then
+          M.set_status(choice)
+        end
       end)
     end
 
@@ -406,5 +793,76 @@ return {
       end
       M.add_comment(s, e)
     end, { desc = 'arbiter: [G]it [R]eview comment (selection)' })
+
+    vim.api.nvim_create_user_command('ArbiterShow', function()
+      M.show()
+    end, { desc = 'arbiter: show current branch notes in quickfix' })
+
+    vim.api.nvim_create_user_command('ArbiterClear', function(opts)
+      M.clear { bang = opts.bang }
+    end, { bang = true, desc = 'arbiter: clear current branch notes' })
+
+    vim.api.nvim_create_user_command('ArbiterSigns', function(opts)
+      local arg = opts.args
+      if arg == 'disable' then
+        vim.g.arbiter_signs_enabled = false
+        vim.diagnostic.reset(diag_ns)
+      elseif arg == 'enable' then
+        vim.g.arbiter_signs_enabled = true
+        refresh_all_listed_buffers()
+      elseif arg == 'toggle' then
+        vim.g.arbiter_signs_enabled = not vim.g.arbiter_signs_enabled
+        if vim.g.arbiter_signs_enabled then
+          refresh_all_listed_buffers()
+        else
+          vim.diagnostic.reset(diag_ns)
+        end
+      else
+        vim.notify('arbiter: usage :ArbiterSigns {enable|disable|toggle}', vim.log.levels.ERROR)
+      end
+    end, {
+      nargs = 1,
+      complete = function()
+        return { 'enable', 'disable', 'toggle' }
+      end,
+      desc = 'arbiter: enable/disable/toggle inline diagnostics',
+    })
+
+    vim.keymap.set('n', '<leader>gR', function()
+      M.clear {}
+    end, { desc = 'arbiter: clear branch [R]eview notes' })
+
+    vim.api.nvim_create_user_command('ArbiterStatus', function(opts)
+      if opts.args == '' then
+        M.pick_status()
+      else
+        M.set_status(opts.args)
+      end
+    end, {
+      nargs = '?',
+      complete = function()
+        return STATUSES
+      end,
+      desc = 'arbiter: set status of note under cursor',
+    })
+
+    vim.keymap.set('n', '<leader>gs', function()
+      M.pick_status()
+    end, { desc = 'arbiter: set [S]tatus of note under cursor' })
+
+    local diag_group = vim.api.nvim_create_augroup('ArbiterDiagnostics', { clear = true })
+    vim.api.nvim_create_autocmd({ 'BufReadPost', 'BufEnter' }, {
+      group = diag_group,
+      callback = function(ev)
+        refresh_diagnostics_for_buf(ev.buf)
+      end,
+    })
+    vim.api.nvim_create_autocmd('User', {
+      group = diag_group,
+      pattern = 'FugitiveChanged',
+      callback = function()
+        refresh_all_listed_buffers()
+      end,
+    })
   end,
 }
