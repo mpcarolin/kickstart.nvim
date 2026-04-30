@@ -15,13 +15,18 @@
 -- Each record carries a `branch` field (resolved at write-time). On detached
 -- HEAD the short SHA is stored as the branch. Commands:
 --   :Arbiter        leave a note on the current line/selection (<leader>gr)
---   :ArbiterShow    load current branch's notes into the quickfix list
---   :ArbiterClear[!] clear notes for the current branch (<leader>gR, prompts)
---   :ArbiterSigns {enable|disable|toggle}  toggle inline diagnostics
---   :ArbiterStatus {pending|in-progress|needs-rereview}  set status of note under cursor (<leader>gs)
+--   :ArbiterShow    show current branch's notes in a popup; <CR> jumps (<leader>gl)
+--   :ArbiterClear[!] clear notes for the current branch (<leader>gc, prompts)
+--   :ArbiterSigns {enable|disable|toggle}  toggle inline diagnostics (<leader>gt)
+--   :ArbiterStatus {pending|in-progress|needs-rereview|resolved}  set status of note under cursor (<leader>gs)
+--   <leader>gd  resolve note(s) on the current line. With one note, resolves
+--               immediately. With multiple, opens a checklist popup
+--               (<Tab>/<Space> toggle · a all · <CR> apply · q cancel).
+--   <leader>gp  preview full text of all notes on the current line
 -- Inline diagnostics (severity varies by status) display notes on their
--- target lines for the current branch only. Records without a `branch` field
--- (older entries) match every branch for back-compat.
+-- target lines for the current branch only. Resolved notes are not rendered
+-- inline (they still appear in :ArbiterShow for audit). Records without a
+-- `branch` field (older entries) match every branch for back-compat.
 --
 -- Record schema (one JSON object per line in <repo>/.git/arbiter.jsonl):
 --   file:        repo-relative path
@@ -31,7 +36,7 @@
 --   branch:      branch name, or short SHA on detached HEAD (null on error)
 --   note:        free-text review comment (markdown ok)
 --   created_at:  ISO-8601 timestamp with offset
---   status:      "pending" (default on write) | "in-progress" | "needs-rereview"
+--   status:      "pending" (default on write) | "in-progress" | "needs-rereview" | "resolved"
 -- An AI assistant addressing a note should rewrite the matching record's
 -- `status` field (identify by file + line_start + branch + created_at).
 -- Records missing `status` are treated as "pending" for back-compat.
@@ -140,7 +145,7 @@ return {
       return out
     end
 
-    local STATUSES = { 'pending', 'in-progress', 'needs-rereview' }
+    local STATUSES = { 'pending', 'in-progress', 'needs-rereview', 'resolved' }
 
     local function normalize_status(s)
       if s == nil or s == vim.NIL or s == '' then
@@ -154,17 +159,60 @@ return {
       return 'pending'
     end
 
+    -- Resolved notes are intentionally omitted — they're done, no need to
+    -- clutter the buffer. They still appear in :ArbiterShow for audit.
     local STATUS_SEVERITY = {
       ['pending'] = vim.diagnostic.severity.HINT,
       ['in-progress'] = vim.diagnostic.severity.INFO,
       ['needs-rereview'] = vim.diagnostic.severity.WARN,
     }
 
-    local STATUS_QF_TYPE = {
-      ['pending'] = 'I',
-      ['in-progress'] = 'W',
-      ['needs-rereview'] = 'E',
+    -- Highlight groups for status-styled lines in popups. Linked to existing
+    -- semantic groups so the colorscheme drives the actual colors. Override
+    -- ArbiterStatus* in your config if you want different palettes.
+    local STATUS_HL = {
+      ['pending'] = 'ArbiterStatusPending',
+      ['in-progress'] = 'ArbiterStatusInProgress',
+      ['needs-rereview'] = 'ArbiterStatusNeedsRereview',
+      ['resolved'] = 'ArbiterStatusResolved',
     }
+    vim.api.nvim_set_hl(0, 'ArbiterStatusPending', { link = 'DiagnosticHint', default = true })
+    vim.api.nvim_set_hl(0, 'ArbiterStatusInProgress', { link = 'DiagnosticInfo', default = true })
+    vim.api.nvim_set_hl(0, 'ArbiterStatusNeedsRereview', { link = 'DiagnosticWarn', default = true })
+    vim.api.nvim_set_hl(0, 'ArbiterStatusResolved', { link = 'Comment', default = true })
+
+    local hl_ns = vim.api.nvim_create_namespace 'arbiter_hl'
+
+    -- Apply a status highlight to one buffer line (0-indexed).
+    local function highlight_status_line(buf, line, status)
+      local group = STATUS_HL[status]
+      if not group then
+        return
+      end
+      vim.api.nvim_buf_set_extmark(buf, hl_ns, line, 0, {
+        end_row = line + 1,
+        end_col = 0,
+        hl_eol = true,
+        hl_group = group,
+      })
+    end
+
+    -- Sort: resolved entries always go last; everything else stays chronological
+    -- (oldest first) by created_at. Stable for ties. Mutates `list` in place.
+    local function sort_resolved_last(list, get_record)
+      get_record = get_record or function(x)
+        return x
+      end
+      table.sort(list, function(a, b)
+        local ra, rb = get_record(a), get_record(b)
+        local a_resolved = normalize_status(ra.status) == 'resolved'
+        local b_resolved = normalize_status(rb.status) == 'resolved'
+        if a_resolved ~= b_resolved then
+          return not a_resolved -- non-resolved comes first
+        end
+        return tostring(ra.created_at or '') < tostring(rb.created_at or '')
+      end)
+    end
 
     -- Atomic rewrite via tmp + rename inside .git/.
     local function rewrite_jsonl(path, records)
@@ -223,17 +271,20 @@ return {
       local diagnostics = {}
       for _, r in ipairs(records) do
         if r.file == rel and type(r.line_start) == 'number' and type(r.line_end) == 'number' then
-          local lnum = math.max(0, r.line_start - 1)
-          local end_lnum = math.max(lnum, r.line_end - 1)
           local status = normalize_status(r.status)
-          table.insert(diagnostics, {
-            lnum = lnum,
-            end_lnum = end_lnum,
-            col = 0,
-            severity = STATUS_SEVERITY[status],
-            source = 'arbiter',
-            message = '[' .. status .. '] ' .. tostring(r.note or ''),
-          })
+          local sev = STATUS_SEVERITY[status]
+          if sev then
+            local lnum = math.max(0, r.line_start - 1)
+            local end_lnum = math.max(lnum, r.line_end - 1)
+            table.insert(diagnostics, {
+              lnum = lnum,
+              end_lnum = end_lnum,
+              col = 0,
+              severity = sev,
+              source = 'arbiter',
+              message = '[' .. status .. '] ' .. tostring(r.note or ''),
+            })
+          end
         end
       end
       vim.diagnostic.set(diag_ns, bufnr, diagnostics)
@@ -371,14 +422,9 @@ return {
 
     local function json_escape(s)
       return (
-        s:gsub('\\', '\\\\')
-          :gsub('"', '\\"')
-          :gsub('\n', '\\n')
-          :gsub('\r', '\\r')
-          :gsub('\t', '\\t')
-          :gsub('[%z\1-\31]', function(c)
-            return string.format('\\u%04x', c:byte())
-          end)
+        s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t'):gsub('[%z\1-\31]', function(c)
+          return string.format('\\u%04x', c:byte())
+        end)
       )
     end
 
@@ -510,10 +556,7 @@ return {
       if is_fugitive_diff then
         local pos = parse_diff_position(bufnr, start_line, end_line)
         if not pos then
-          vim.notify(
-            'arbiter: could not locate diff header / hunk for selection',
-            vim.log.levels.ERROR
-          )
+          vim.notify('arbiter: could not locate diff header / hunk for selection', vim.log.levels.ERROR)
           return
         end
         file_path = pos.file
@@ -555,10 +598,7 @@ return {
       end
 
       if deletions_only then
-        vim.notify(
-          'arbiter: selection only contains deletions; recorded at hunk start',
-          vim.log.levels.WARN
-        )
+        vim.notify('arbiter: selection only contains deletions; recorded at hunk start', vim.log.levels.WARN)
       end
 
       local meta = {
@@ -594,13 +634,7 @@ return {
           return
         end
         vim.notify(
-          string.format(
-            'arbiter: saved %s:%d-%d → %s',
-            meta.file,
-            meta.line_start,
-            meta.line_end,
-            vim.fn.fnamemodify(jsonl_path, ':~')
-          ),
+          string.format('arbiter: saved %s:%d-%d → %s', meta.file, meta.line_start, meta.line_end, vim.fn.fnamemodify(jsonl_path, ':~')),
           vim.log.levels.INFO
         )
         -- Refresh diagnostics on the source buffer so the new note shows up
@@ -624,32 +658,99 @@ return {
         vim.notify('arbiter: no notes for ' .. (branch or '<unknown>'), vim.log.levels.INFO)
         return
       end
-      local items = {}
+      sort_resolved_last(records)
+
+      local repo_root_clean = repo_root:gsub('/$', '')
+      local entries = {} -- { fname, lnum, status, preview, full_note }
       for _, r in ipairs(records) do
         if r.file and type(r.line_start) == 'number' then
           local note = tostring(r.note or '')
           local first_nl = note:find '\n'
-          local preview
-          if first_nl then
-            preview = note:sub(1, first_nl - 1) .. ' …'
-          else
-            preview = note
-          end
-          local status = normalize_status(r.status)
-          table.insert(items, {
-            filename = repo_root .. '/' .. r.file,
+          local preview = first_nl and (note:sub(1, first_nl - 1) .. ' …') or note
+          table.insert(entries, {
+            fname = repo_root_clean .. '/' .. r.file,
+            file_rel = r.file,
             lnum = r.line_start,
-            end_lnum = type(r.line_end) == 'number' and r.line_end or r.line_start,
-            text = '[' .. status .. '] ' .. preview,
-            type = STATUS_QF_TYPE[status],
+            status = normalize_status(r.status),
+            preview = preview,
           })
         end
       end
-      vim.fn.setqflist({}, ' ', {
-        title = 'arbiter notes (' .. (branch or '<unknown>') .. ')',
-        items = items,
+      if #entries == 0 then
+        vim.notify('arbiter: no notes for ' .. (branch or '<unknown>'), vim.log.levels.INFO)
+        return
+      end
+
+      -- Build display lines and pick a sensible width.
+      local lines = {
+        string.format('# arbiter notes (%s) — %d entries', branch or '<unknown>', #entries),
+        '# <CR> jump · q/<Esc> close',
+        '',
+      }
+      local header_rows = #lines
+      for _, e in ipairs(entries) do
+        table.insert(lines, string.format('[%s] %s:%d  %s', e.status, e.file_rel, e.lnum, e.preview))
+      end
+
+      local width = 40
+      for _, l in ipairs(lines) do
+        if #l > width then
+          width = #l
+        end
+      end
+      width = math.min(width + 2, math.floor(vim.o.columns * 0.85))
+      local height = math.min(#lines + 1, math.floor(vim.o.lines * 0.6))
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].bufhidden = 'wipe'
+      vim.bo[buf].filetype = 'arbiter-list'
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      for i, e in ipairs(entries) do
+        highlight_status_line(buf, header_rows + i - 1, e.status)
+      end
+      vim.bo[buf].modifiable = false
+
+      local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 2)
+      local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+      local win = vim.api.nvim_open_win(buf, true, {
+        relative = 'editor',
+        row = row,
+        col = col,
+        width = width,
+        height = height,
+        style = 'minimal',
+        border = 'rounded',
+        title = ' arbiter notes ',
+        title_pos = 'center',
       })
-      vim.cmd 'copen'
+      vim.wo[win].cursorline = true
+      vim.wo[win].wrap = false
+      -- Land on the first entry (skip header rows).
+      vim.api.nvim_win_set_cursor(win, { math.min(header_rows + 1, vim.api.nvim_buf_line_count(buf)), 0 })
+
+      local function close()
+        if vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_win_close(win, true)
+        end
+      end
+
+      local function jump()
+        local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
+        local i = cursor_row - header_rows
+        if i < 1 or i > #entries then
+          return
+        end
+        local e = entries[i]
+        close()
+        vim.cmd('edit ' .. vim.fn.fnameescape(e.fname))
+        pcall(vim.api.nvim_win_set_cursor, 0, { e.lnum, 0 })
+        vim.cmd 'normal! zz'
+      end
+
+      local opts = { buffer = buf, nowait = true, silent = true }
+      vim.keymap.set('n', '<CR>', jump, opts)
+      vim.keymap.set('n', 'q', close, opts)
+      vim.keymap.set('n', '<Esc>', close, opts)
     end
 
     function M.clear(opts)
@@ -688,10 +789,7 @@ return {
         end
         vim.diagnostic.reset(diag_ns)
         refresh_all_listed_buffers()
-        vim.notify(
-          string.format('arbiter: cleared %d notes for %s', #mine, branch),
-          vim.log.levels.INFO
-        )
+        vim.notify(string.format('arbiter: cleared %d notes for %s', #mine, branch), vim.log.levels.INFO)
       end
 
       if opts.bang then
@@ -708,10 +806,10 @@ return {
       end)
     end
 
-    -- Find the record covering the cursor in the current buffer (current
-    -- branch, file matches buffer, line range covers cursor line). Returns
-    -- (records, index) into the original on-disk array, or nil.
-    local function find_record_at_cursor()
+    -- Find every record on the current line. Returns (all, matches, jsonl_path, err)
+    -- where `all` is the full JSONL array (so callers can mutate + rewrite),
+    -- and `matches` is a list of { idx = <index into all>, record = <r> }.
+    local function find_records_at_cursor()
       local bufnr = vim.api.nvim_get_current_buf()
       local bufname = vim.api.nvim_buf_get_name(bufnr)
       if bufname == '' then
@@ -731,6 +829,7 @@ return {
       local branch = current_branch(git_dir)
       local cursor_lnum = vim.fn.line '.'
       local all = read_jsonl(jsonl_path)
+      local matches = {}
       for i, r in ipairs(all) do
         local matches_branch = r.branch == nil or r.branch == vim.NIL or r.branch == branch
         if
@@ -741,35 +840,339 @@ return {
           and cursor_lnum >= r.line_start
           and cursor_lnum <= r.line_end
         then
-          return all, i, jsonl_path, nil
+          table.insert(matches, { idx = i, record = r })
         end
       end
-      return nil, nil, nil, 'no arbiter note on this line'
+      sort_resolved_last(matches, function(m)
+        return m.record
+      end)
+      return all, matches, jsonl_path, nil
     end
 
-    function M.set_status(status)
-      status = normalize_status(status)
-      local all, idx, jsonl_path, err = find_record_at_cursor()
+    local function note_label(record)
+      local note = tostring(record.note or '')
+      local first_nl = note:find '\n'
+      local preview = first_nl and note:sub(1, first_nl - 1) or note
+      if #preview > 60 then
+        preview = preview:sub(1, 57) .. '…'
+      end
+      return string.format('[%s] %s', normalize_status(record.status), preview)
+    end
+
+    -- Resolve which match the user wants to act on. If exactly one, use it
+    -- directly. If many, prompt with vim.ui.select. Calls cb(all, idx, jsonl_path)
+    -- on success, does nothing (after notifying) on cancel/no-match.
+    local function pick_record_at_cursor(prompt, cb)
+      local all, matches, jsonl_path, err = find_records_at_cursor()
       if err then
         vim.notify('arbiter: ' .. err, vim.log.levels.WARN)
         return
       end
-      all[idx].status = status
-      local ok, werr = rewrite_jsonl(jsonl_path, all)
-      if not ok then
-        vim.notify('arbiter: status write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+      if not matches or #matches == 0 then
+        vim.notify('arbiter: no notes on this line', vim.log.levels.WARN)
         return
       end
-      refresh_diagnostics_for_buf(vim.api.nvim_get_current_buf())
-      vim.notify('arbiter: status → ' .. status, vim.log.levels.INFO)
+      if #matches == 1 then
+        cb(all, matches[1].idx, jsonl_path)
+        return
+      end
+      vim.ui.select(matches, {
+        prompt = prompt or 'arbiter: which note?',
+        format_item = function(m)
+          return note_label(m.record)
+        end,
+      }, function(choice)
+        if choice then
+          cb(all, choice.idx, jsonl_path)
+        end
+      end)
+    end
+
+    function M.set_status(status)
+      status = normalize_status(status)
+      pick_record_at_cursor('arbiter: set status on which note?', function(all, idx, jsonl_path)
+        all[idx].status = status
+        local ok, werr = rewrite_jsonl(jsonl_path, all)
+        if not ok then
+          vim.notify('arbiter: status write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+          return
+        end
+        refresh_diagnostics_for_buf(vim.api.nvim_get_current_buf())
+        vim.notify('arbiter: status → ' .. status, vim.log.levels.INFO)
+      end)
     end
 
     function M.pick_status()
-      vim.ui.select(STATUSES, { prompt = 'arbiter status:' }, function(choice)
-        if choice then
-          M.set_status(choice)
-        end
+      pick_record_at_cursor('arbiter: which note?', function(all, idx, jsonl_path)
+        vim.ui.select(STATUSES, { prompt = 'arbiter status:' }, function(choice)
+          if not choice then
+            return
+          end
+          all[idx].status = normalize_status(choice)
+          local ok, werr = rewrite_jsonl(jsonl_path, all)
+          if not ok then
+            vim.notify('arbiter: status write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+            return
+          end
+          refresh_diagnostics_for_buf(vim.api.nvim_get_current_buf())
+          vim.notify('arbiter: status → ' .. choice, vim.log.levels.INFO)
+        end)
       end)
+    end
+
+    -- Multi-select buffer for resolving 1+ notes on the current line.
+    -- <Tab>/<Space>: toggle  ·  a: select all  ·  <CR>: apply  ·  q/<Esc>: cancel.
+    local function open_resolve_picker(all, matches, jsonl_path, source_buf)
+      -- Pre-check notes already resolved so the picker reflects current state.
+      local selected = {}
+      for i, m in ipairs(matches) do
+        selected[i] = normalize_status(m.record.status) == 'resolved'
+      end
+
+      local function render_lines()
+        local lines = { '# resolve notes  (<Tab> toggle · a all · <CR> apply · q cancel)', '' }
+        for i, m in ipairs(matches) do
+          local mark = selected[i] and '[x]' or '[ ]'
+          table.insert(lines, string.format('%s %s', mark, note_label(m.record)))
+        end
+        return lines
+      end
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].bufhidden = 'wipe'
+      vim.bo[buf].filetype = 'arbiter-picker'
+      local function redraw()
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, render_lines())
+        vim.bo[buf].modifiable = false
+        vim.api.nvim_buf_clear_namespace(buf, hl_ns, 0, -1)
+        for i, m in ipairs(matches) do
+          highlight_status_line(buf, i + 1, normalize_status(m.record.status))
+        end
+      end
+      redraw()
+
+      local max_w = math.min(80, math.floor(vim.o.columns * 0.7))
+      local width = 30
+      for _, l in ipairs(render_lines()) do
+        if #l > width then
+          width = #l
+        end
+      end
+      width = math.min(width + 2, max_w)
+      local height = math.min(#matches + 3, math.floor(vim.o.lines * 0.5))
+
+      local win = vim.api.nvim_open_win(buf, true, {
+        relative = 'cursor',
+        row = 1,
+        col = 0,
+        width = width,
+        height = height,
+        style = 'minimal',
+        border = 'rounded',
+        title = ' arbiter: resolve ',
+        title_pos = 'center',
+      })
+      vim.wo[win].cursorline = true
+      vim.wo[win].wrap = false
+      -- Park the cursor on the first selectable row (line 3 = first item).
+      vim.api.nvim_win_set_cursor(win, { math.min(3, vim.api.nvim_buf_line_count(buf)), 0 })
+
+      local function close()
+        if vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_win_close(win, true)
+        end
+      end
+
+      local function row_to_match_idx(row)
+        local i = row - 2 -- header + blank line take rows 1 and 2
+        if i >= 1 and i <= #matches then
+          return i
+        end
+      end
+
+      local function toggle()
+        local row = vim.api.nvim_win_get_cursor(win)[1]
+        local i = row_to_match_idx(row)
+        if i then
+          selected[i] = not selected[i]
+          redraw()
+          vim.api.nvim_win_set_cursor(win, { row, 0 })
+        end
+      end
+
+      local function select_all()
+        local any_unset = false
+        for i = 1, #matches do
+          if not selected[i] then
+            any_unset = true
+            break
+          end
+        end
+        for i = 1, #matches do
+          selected[i] = any_unset -- if anything was unset, select all; else clear
+        end
+        local row = vim.api.nvim_win_get_cursor(win)[1]
+        redraw()
+        vim.api.nvim_win_set_cursor(win, { row, 0 })
+      end
+
+      local function apply()
+        -- Only count notes that *transition* into resolved. Pre-checked
+        -- already-resolved entries are no-ops on apply.
+        local changed = 0
+        local any_checked = false
+        for i, m in ipairs(matches) do
+          if selected[i] then
+            any_checked = true
+            if normalize_status(m.record.status) ~= 'resolved' then
+              all[m.idx].status = 'resolved'
+              changed = changed + 1
+            end
+          end
+        end
+        if not any_checked then
+          -- Nothing toggled at all — treat the cursor row as the implicit pick.
+          local row = vim.api.nvim_win_get_cursor(win)[1]
+          local i = row_to_match_idx(row)
+          if i and normalize_status(matches[i].record.status) ~= 'resolved' then
+            all[matches[i].idx].status = 'resolved'
+            changed = 1
+          end
+        end
+        close()
+        if changed == 0 then
+          vim.notify('arbiter: no changes', vim.log.levels.INFO)
+          return
+        end
+        local ok, werr = rewrite_jsonl(jsonl_path, all)
+        if not ok then
+          vim.notify('arbiter: resolve write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+          return
+        end
+        if vim.api.nvim_buf_is_valid(source_buf) then
+          refresh_diagnostics_for_buf(source_buf)
+        end
+        vim.notify(string.format('arbiter: resolved %d note%s', changed, changed == 1 and '' or 's'), vim.log.levels.INFO)
+      end
+
+      local opts = { buffer = buf, nowait = true, silent = true }
+      vim.keymap.set('n', '<Tab>', toggle, opts)
+      vim.keymap.set('n', '<Space>', toggle, opts)
+      vim.keymap.set('n', 'a', select_all, opts)
+      vim.keymap.set('n', '<CR>', apply, opts)
+      vim.keymap.set('n', 'q', close, opts)
+      vim.keymap.set('n', '<Esc>', close, opts)
+    end
+
+    function M.resolve()
+      local all, matches, jsonl_path, err = find_records_at_cursor()
+      if err then
+        vim.notify('arbiter: ' .. err, vim.log.levels.WARN)
+        return
+      end
+      if not matches or #matches == 0 then
+        vim.notify('arbiter: no notes on this line', vim.log.levels.WARN)
+        return
+      end
+      local source_buf = vim.api.nvim_get_current_buf()
+      if #matches == 1 then
+        all[matches[1].idx].status = 'resolved'
+        local ok, werr = rewrite_jsonl(jsonl_path, all)
+        if not ok then
+          vim.notify('arbiter: resolve write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+          return
+        end
+        refresh_diagnostics_for_buf(source_buf)
+        vim.notify('arbiter: resolved', vim.log.levels.INFO)
+        return
+      end
+      open_resolve_picker(all, matches, jsonl_path, source_buf)
+    end
+
+    function M.preview()
+      local _, matches, _, err = find_records_at_cursor()
+      if err then
+        vim.notify('arbiter: ' .. err, vim.log.levels.WARN)
+        return
+      end
+      if not matches or #matches == 0 then
+        vim.notify('arbiter: no notes on this line', vim.log.levels.WARN)
+        return
+      end
+      local lines = {}
+      local heading_rows = {} -- { { row = 0-indexed, status = '...' } }
+      for i, m in ipairs(matches) do
+        local r = m.record
+        if i > 1 then
+          table.insert(lines, '')
+          table.insert(lines, '---')
+          table.insert(lines, '')
+        end
+        local status = normalize_status(r.status)
+        local range = string.format('L%d-%d', r.line_start, r.line_end)
+        table.insert(lines, string.format('# [%s] %s · %s', status, range, r.created_at or ''))
+        table.insert(heading_rows, { row = #lines - 1, status = status })
+        table.insert(lines, '')
+        for note_line in (tostring(r.note or '')):gmatch '[^\n]+' do
+          table.insert(lines, note_line)
+        end
+      end
+
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.bo[buf].filetype = 'markdown'
+      vim.bo[buf].modifiable = false
+      vim.bo[buf].bufhidden = 'wipe'
+      for _, h in ipairs(heading_rows) do
+        highlight_status_line(buf, h.row, h.status)
+      end
+
+      local max_w = math.min(80, math.floor(vim.o.columns * 0.7))
+      local width = 20
+      for _, l in ipairs(lines) do
+        if #l > width then
+          width = #l
+        end
+      end
+      width = math.min(width + 2, max_w)
+      local height = math.min(#lines + 1, math.floor(vim.o.lines * 0.5))
+
+      local source_buf = vim.api.nvim_get_current_buf()
+      local win = vim.api.nvim_open_win(buf, true, {
+        relative = 'cursor',
+        row = 1,
+        col = 0,
+        width = width,
+        height = height,
+        style = 'minimal',
+        border = 'rounded',
+        title = ' arbiter notes (q to close) ',
+        title_pos = 'center',
+        focusable = true,
+      })
+      vim.wo[win].wrap = true
+      vim.wo[win].linebreak = true
+      vim.wo[win].cursorline = true
+
+      local function close()
+        if vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_win_close(win, true)
+        end
+      end
+
+      -- q / <Esc> close from inside the popup.
+      vim.keymap.set('n', 'q', close, { buffer = buf, nowait = true, silent = true })
+      vim.keymap.set('n', '<Esc>', close, { buffer = buf, nowait = true, silent = true })
+
+      -- Dismiss only when the cursor moves *in the source buffer*. Movement
+      -- inside the popup (after <C-w>w) doesn't fire CursorMoved on the
+      -- source buf, so scrolling inside the popup is safe.
+      vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI', 'InsertEnter' }, {
+        buffer = source_buf,
+        once = true,
+        callback = close,
+      })
     end
 
     vim.api.nvim_create_user_command('Arbiter', function(opts)
@@ -828,9 +1231,24 @@ return {
       desc = 'arbiter: enable/disable/toggle inline diagnostics',
     })
 
-    vim.keymap.set('n', '<leader>gR', function()
+    vim.keymap.set('n', '<leader>gc', function()
       M.clear {}
-    end, { desc = 'arbiter: clear branch [R]eview notes' })
+    end, { desc = 'arbiter: [C]lear branch review notes' })
+
+    vim.keymap.set('n', '<leader>gl', function()
+      M.show()
+    end, { desc = 'arbiter: [L]ist branch review notes (quickfix)' })
+
+    vim.keymap.set('n', '<leader>gt', function()
+      vim.g.arbiter_signs_enabled = not vim.g.arbiter_signs_enabled
+      if vim.g.arbiter_signs_enabled then
+        refresh_all_listed_buffers()
+        vim.notify('arbiter: signs enabled', vim.log.levels.INFO)
+      else
+        vim.diagnostic.reset(diag_ns)
+        vim.notify('arbiter: signs disabled', vim.log.levels.INFO)
+      end
+    end, { desc = 'arbiter: [T]oggle inline diagnostics' })
 
     vim.api.nvim_create_user_command('ArbiterStatus', function(opts)
       if opts.args == '' then
@@ -850,6 +1268,14 @@ return {
       M.pick_status()
     end, { desc = 'arbiter: set [S]tatus of note under cursor' })
 
+    vim.keymap.set('n', '<leader>gd', function()
+      M.resolve()
+    end, { desc = 'arbiter: mark note under cursor [D]one (resolved)' })
+
+    vim.keymap.set('n', '<leader>gp', function()
+      M.preview()
+    end, { desc = 'arbiter: [P]review notes on current line in floating window' })
+
     local diag_group = vim.api.nvim_create_augroup('ArbiterDiagnostics', { clear = true })
     vim.api.nvim_create_autocmd({ 'BufReadPost', 'BufEnter' }, {
       group = diag_group,
@@ -864,5 +1290,15 @@ return {
         refresh_all_listed_buffers()
       end,
     })
+
+    -- Lazy may finish our config() after BufReadPost has already fired for
+    -- the first opened buffer. Sweep all listed buffers now so diagnostics
+    -- show up on the file you opened nvim with, without needing a manual
+    -- :ArbiterRefresh.
+    vim.schedule(refresh_all_listed_buffers)
+
+    vim.api.nvim_create_user_command('ArbiterRefresh', function()
+      refresh_all_listed_buffers()
+    end, { desc = 'arbiter: re-read JSONL and refresh inline diagnostics' })
   end,
 }
