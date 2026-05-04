@@ -653,44 +653,56 @@ return {
         return
       end
       local branch = current_branch(git_dir)
-      local records = filter_for_branch(read_jsonl(jsonl_path), branch)
-      if #records == 0 then
-        vim.notify('arbiter: no notes for ' .. (branch or '<unknown>'), vim.log.levels.INFO)
-        return
-      end
-      sort_resolved_last(records)
-
       local repo_root_clean = repo_root:gsub('/$', '')
-      local entries = {} -- { fname, lnum, status, preview, full_note }
-      for _, r in ipairs(records) do
-        if r.file and type(r.line_start) == 'number' then
-          local note = tostring(r.note or '')
-          local first_nl = note:find '\n'
-          local preview = first_nl and (note:sub(1, first_nl - 1) .. ' …') or note
-          table.insert(entries, {
-            fname = repo_root_clean .. '/' .. r.file,
-            file_rel = r.file,
-            lnum = r.line_start,
-            status = normalize_status(r.status),
-            preview = preview,
-          })
+
+      local header_rows = 3
+      local entries = {}
+
+      local function build_entries()
+        local records = filter_for_branch(read_jsonl(jsonl_path), branch)
+        sort_resolved_last(records)
+        local out = {}
+        for _, r in ipairs(records) do
+          if r.file and type(r.line_start) == 'number' then
+            local note = tostring(r.note or '')
+            local first_nl = note:find '\n'
+            local preview = first_nl and (note:sub(1, first_nl - 1) .. ' …') or note
+            table.insert(out, {
+              fname = repo_root_clean .. '/' .. r.file,
+              file_rel = r.file,
+              lnum = r.line_start,
+              status = normalize_status(r.status),
+              preview = preview,
+              created_at = r.created_at,
+            })
+          end
         end
+        return out
       end
+
+      entries = build_entries()
       if #entries == 0 then
         vim.notify('arbiter: no notes for ' .. (branch or '<unknown>'), vim.log.levels.INFO)
         return
       end
 
-      -- Build display lines and pick a sensible width.
-      local lines = {
-        string.format('# arbiter notes (%s) — %d entries', branch or '<unknown>', #entries),
-        '# <CR> jump · q/<Esc> close',
-        '',
-      }
-      local header_rows = #lines
-      for _, e in ipairs(entries) do
-        table.insert(lines, string.format('[%s] %s:%d  %s', e.status, e.file_rel, e.lnum, e.preview))
+      local function format_lines(es)
+        local lines = {
+          string.format('# arbiter notes (%s) — %d entries', branch or '<unknown>', #es),
+          '# <CR> jump · d resolve · s status · r refresh · q/<Esc> close',
+          '',
+        }
+        if #es == 0 then
+          table.insert(lines, '(no notes)')
+        else
+          for _, e in ipairs(es) do
+            table.insert(lines, string.format('[%s] %s:%d  %s', e.status, e.file_rel, e.lnum, e.preview))
+          end
+        end
+        return lines
       end
+
+      local lines = format_lines(entries)
 
       local width = 40
       for _, l in ipairs(lines) do
@@ -728,6 +740,49 @@ return {
       -- Land on the first entry (skip header rows).
       vim.api.nvim_win_set_cursor(win, { math.min(header_rows + 1, vim.api.nvim_buf_line_count(buf)), 0 })
 
+      local function rebuild()
+        if not vim.api.nvim_win_is_valid(win) or not vim.api.nvim_buf_is_valid(buf) then
+          return
+        end
+        local prev_row = vim.api.nvim_win_get_cursor(win)[1]
+        entries = build_entries()
+        local new_lines = format_lines(entries)
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, new_lines)
+        vim.bo[buf].modifiable = false
+        vim.api.nvim_buf_clear_namespace(buf, hl_ns, 0, -1)
+        for i, e in ipairs(entries) do
+          highlight_status_line(buf, header_rows + i - 1, e.status)
+        end
+        local last_entry_row = header_rows + math.max(#entries, 1)
+        local total = vim.api.nvim_buf_line_count(buf)
+        local clamped = math.min(prev_row, last_entry_row, total)
+        clamped = math.max(clamped, math.min(header_rows + 1, total))
+        pcall(vim.api.nvim_win_set_cursor, win, { clamped, 0 })
+      end
+
+      local function current_entry()
+        local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
+        local i = cursor_row - header_rows
+        if i < 1 or i > #entries then
+          return nil
+        end
+        return entries[i]
+      end
+
+      local function find_record_index(all, e)
+        for i, r in ipairs(all) do
+          if
+            r.file == e.file_rel
+            and r.line_start == e.lnum
+            and tostring(r.created_at or '') == tostring(e.created_at or '')
+          then
+            return i
+          end
+        end
+        return nil
+      end
+
       local function close()
         if vim.api.nvim_win_is_valid(win) then
           vim.api.nvim_win_close(win, true)
@@ -735,20 +790,79 @@ return {
       end
 
       local function jump()
-        local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
-        local i = cursor_row - header_rows
-        if i < 1 or i > #entries then
+        local e = current_entry()
+        if not e then
           return
         end
-        local e = entries[i]
         close()
         vim.cmd('edit ' .. vim.fn.fnameescape(e.fname))
         pcall(vim.api.nvim_win_set_cursor, 0, { e.lnum, 0 })
         vim.cmd 'normal! zz'
       end
 
+      local function resolve_under_cursor()
+        local e = current_entry()
+        if not e then
+          return
+        end
+        if e.status == 'resolved' then
+          vim.notify('arbiter: already resolved', vim.log.levels.INFO)
+          return
+        end
+        local all = read_jsonl(jsonl_path)
+        local idx = find_record_index(all, e)
+        if not idx then
+          vim.notify('arbiter: record not found (file changed?)', vim.log.levels.WARN)
+          return
+        end
+        all[idx].status = 'resolved'
+        local ok, werr = rewrite_jsonl(jsonl_path, all)
+        if not ok then
+          vim.notify('arbiter: resolve write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+          return
+        end
+        refresh_all_listed_buffers()
+        vim.notify('arbiter: resolved', vim.log.levels.INFO)
+        rebuild()
+      end
+
+      local function status_under_cursor()
+        local e = current_entry()
+        if not e then
+          return
+        end
+        vim.ui.select(STATUSES, { prompt = 'arbiter status:' }, function(choice)
+          if not choice then
+            return
+          end
+          local all = read_jsonl(jsonl_path)
+          local idx = find_record_index(all, e)
+          if not idx then
+            vim.notify('arbiter: record not found (file changed?)', vim.log.levels.WARN)
+            return
+          end
+          local new_status = normalize_status(choice)
+          if normalize_status(all[idx].status) == new_status then
+            vim.notify('arbiter: no changes', vim.log.levels.INFO)
+            return
+          end
+          all[idx].status = new_status
+          local ok, werr = rewrite_jsonl(jsonl_path, all)
+          if not ok then
+            vim.notify('arbiter: status write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+            return
+          end
+          refresh_all_listed_buffers()
+          vim.notify('arbiter: status → ' .. choice, vim.log.levels.INFO)
+          rebuild()
+        end)
+      end
+
       local opts = { buffer = buf, nowait = true, silent = true }
       vim.keymap.set('n', '<CR>', jump, opts)
+      vim.keymap.set('n', 'd', resolve_under_cursor, opts)
+      vim.keymap.set('n', 's', status_under_cursor, opts)
+      vim.keymap.set('n', 'r', rebuild, opts)
       vim.keymap.set('n', 'q', close, opts)
       vim.keymap.set('n', '<Esc>', close, opts)
     end
