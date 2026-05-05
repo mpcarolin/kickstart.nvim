@@ -34,6 +34,9 @@
 vim.g.mapleader = ' '
 vim.g.maplocalleader = ' '
 
+-- Load per-machine config (gitignored, sibling of init.lua). No-op if file is absent.
+pcall(dofile, vim.fn.stdpath('config') .. '/env.lua')
+
 -- Set to true if you have a Nerd Font installed and selected in the terminal
 vim.g.have_nerd_font = false
 
@@ -357,7 +360,9 @@ require('lazy').setup({
       spec = {
         { '<leader>s', group = '[S]earch' },
         { '<leader>t', group = '[T]oggle' },
+        { '<leader>k', group = '[K]heckmate / Todo' },
         { '<leader>h', group = 'Git [H]unk', mode = { 'n', 'v' } },
+        { '<leader>n', desc = '[N]otes tree' },
       },
     },
   },
