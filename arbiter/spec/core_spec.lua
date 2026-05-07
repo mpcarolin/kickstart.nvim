@@ -298,6 +298,158 @@ describe('create_note', function()
     os.remove(p)
     assert.equals(core.record_id(rec), core.record_id(read[1]))
   end)
+
+  it("defaults author to 'human'", function()
+    local p = tmpfile()
+    local rec = core.create_note {
+      jsonl_path = p,
+      file = 'a.lua',
+      line_start = 1,
+      line_end = 1,
+      note = 'x',
+      branch = 'm',
+    }
+    os.remove(p)
+    assert.equals('human', rec.author)
+  end)
+
+  it('honors explicit author', function()
+    local p = tmpfile()
+    local rec = core.create_note {
+      jsonl_path = p,
+      file = 'a.lua',
+      line_start = 1,
+      line_end = 1,
+      note = 'x',
+      branch = 'm',
+      author = 'claude-opus',
+    }
+    os.remove(p)
+    assert.equals('claude-opus', rec.author)
+  end)
+
+  it("does not initialize comments on create", function()
+    local p = tmpfile()
+    core.create_note {
+      jsonl_path = p,
+      file = 'a.lua',
+      line_start = 1,
+      line_end = 1,
+      note = 'x',
+      branch = 'm',
+    }
+    local raw = io.open(p, 'r'):read '*a'
+    os.remove(p)
+    -- comments key should not appear at all (avoids cjson encoding {} as object)
+    assert.is_nil(raw:find '"comments"')
+  end)
+end)
+
+describe('normalize_comments', function()
+  it('returns {} for missing/null/non-table', function()
+    assert.same({}, core.normalize_comments {})
+    assert.same({}, core.normalize_comments { comments = nil })
+    assert.same({}, core.normalize_comments { comments = core.NULL })
+    assert.same({}, core.normalize_comments { comments = 'not a table' })
+    assert.same({}, core.normalize_comments(nil))
+  end)
+  it('returns the comments table when present', function()
+    local c = { { author = 'ai', body = 'hi', created_at = 't' } }
+    local out = core.normalize_comments { comments = c }
+    assert.equals(c, out)
+    assert.equals(1, #out)
+  end)
+end)
+
+describe('normalize_author', function()
+  it("defaults to 'human' for nil/null/empty", function()
+    assert.equals('human', core.normalize_author {})
+    assert.equals('human', core.normalize_author { author = nil })
+    assert.equals('human', core.normalize_author { author = core.NULL })
+    assert.equals('human', core.normalize_author { author = '' })
+    assert.equals('human', core.normalize_author(nil))
+  end)
+  it('returns the author string when set', function()
+    assert.equals('ai', core.normalize_author { author = 'ai' })
+    assert.equals('claude-opus', core.normalize_author { author = 'claude-opus' })
+  end)
+end)
+
+describe('append_reply', function()
+  it("defaults reply author to 'ai'", function()
+    local records = { { file = 'a.lua', line_start = 1, line_end = 1, note = 'x' } }
+    local reply, err = core.append_reply(records, 1, { body = 'hello' })
+    assert.is_nil(err)
+    assert.equals('ai', reply.author)
+    assert.equals('hello', reply.body)
+    assert.is_string(reply.created_at)
+  end)
+
+  it('honors explicit author', function()
+    local records = { { file = 'a.lua', line_start = 1, line_end = 1, note = 'x' } }
+    local reply = core.append_reply(records, 1, { body = 'b', author = 'claude-opus' })
+    assert.equals('claude-opus', reply.author)
+  end)
+
+  it('lazy-inits comments and inserts in order', function()
+    local records = { { file = 'a.lua', line_start = 1, line_end = 1, note = 'x' } }
+    assert.is_nil(records[1].comments)
+    core.append_reply(records, 1, { body = 'first' })
+    assert.is_table(records[1].comments)
+    assert.equals(1, #records[1].comments)
+    core.append_reply(records, 1, { body = 'second' })
+    assert.equals(2, #records[1].comments)
+    assert.equals('first', records[1].comments[1].body)
+    assert.equals('second', records[1].comments[2].body)
+  end)
+
+  it('rejects empty body', function()
+    local records = { { file = 'a.lua', line_start = 1, line_end = 1, note = 'x' } }
+    local reply, err = core.append_reply(records, 1, { body = '' })
+    assert.is_nil(reply)
+    assert.is_string(err)
+    local reply2, err2 = core.append_reply(records, 1, { body = '\n\n' })
+    assert.is_nil(reply2)
+    assert.is_string(err2)
+  end)
+
+  it('does not change parent record_id', function()
+    local records = { { file = 'a.lua', line_start = 1, line_end = 1, branch = 'm', created_at = 't', note = 'x' } }
+    local before_id = core.record_id(records[1])
+    core.append_reply(records, 1, { body = 'r' })
+    local after_id = core.record_id(records[1])
+    assert.equals(before_id, after_id)
+  end)
+
+  it('round-trips through rewrite_jsonl (cjson nested array)', function()
+    local p = tmpfile()
+    local records = {
+      {
+        file = 'a.lua',
+        line_start = 1,
+        line_end = 1,
+        branch = 'm',
+        created_at = 't',
+        note = 'parent',
+        status = 'pending',
+      },
+    }
+    core.append_reply(records, 1, { body = 'first', author = 'ai' })
+    core.append_reply(records, 1, { body = 'second', author = 'claude-opus' })
+    core.rewrite_jsonl(p, records)
+    local raw = io.open(p, 'r'):read '*a'
+    -- Comments must serialize as a JSON array, not an object.
+    assert.is_truthy(raw:find '"comments":%[')
+    local readback = core.read_jsonl(p)
+    os.remove(p)
+    assert.equals(1, #readback)
+    local replies = core.normalize_comments(readback[1])
+    assert.equals(2, #replies)
+    assert.equals('first', replies[1].body)
+    assert.equals('ai', replies[1].author)
+    assert.equals('second', replies[2].body)
+    assert.equals('claude-opus', replies[2].author)
+  end)
 end)
 
 describe('apply_filters', function()

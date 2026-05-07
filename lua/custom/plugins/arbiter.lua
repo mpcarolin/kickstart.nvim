@@ -116,6 +116,12 @@ return {
     vim.api.nvim_set_hl(0, 'ArbiterStatusNeedsRereview', { link = 'DiagnosticWarn', default = true })
     vim.api.nvim_set_hl(0, 'ArbiterStatusResolved', { link = 'Comment', default = true })
 
+    -- Author highlight groups for reply headers in the preview window. Human
+    -- replies use Comment (diminished) since the human is the local actor;
+    -- AI replies use Function so they stand out in the thread.
+    vim.api.nvim_set_hl(0, 'ArbiterAuthorHuman', { link = 'Comment', default = true })
+    vim.api.nvim_set_hl(0, 'ArbiterAuthorAI', { link = 'Function', default = true })
+
     local hl_ns = vim.api.nvim_create_namespace 'arbiter_hl'
 
     -- Apply a status highlight to one buffer line (0-indexed).
@@ -130,6 +136,26 @@ return {
         hl_eol = true,
         hl_group = group,
       })
+    end
+
+    -- Apply an author highlight to the reply header + rule rows (0-indexed).
+    -- Human replies render diminished; AI replies stand out.
+    local function highlight_reply_lines(buf, rows, author)
+      local norm = (author or 'human'):lower()
+      local group
+      if norm == 'human' then
+        group = 'ArbiterAuthorHuman'
+      else
+        group = 'ArbiterAuthorAI'
+      end
+      for _, line in ipairs(rows) do
+        vim.api.nvim_buf_set_extmark(buf, hl_ns, line, 0, {
+          end_row = line + 1,
+          end_col = 0,
+          hl_eol = false,
+          hl_group = group,
+        })
+      end
     end
 
     local diag_ns = vim.api.nvim_create_namespace 'arbiter'
@@ -173,13 +199,15 @@ return {
           if sev then
             local lnum = math.max(0, r.line_start - 1)
             local end_lnum = math.max(lnum, r.line_end - 1)
+            local n_replies = #core.normalize_comments(r)
+            local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
             table.insert(diagnostics, {
               lnum = lnum,
               end_lnum = end_lnum,
               col = 0,
               severity = sev,
               source = 'arbiter',
-              message = '[' .. status .. '] ' .. tostring(r.note or ''),
+              message = '[' .. status .. '] ' .. tostring(r.note or '') .. suffix,
             })
           end
         end
@@ -310,7 +338,8 @@ return {
       vim.bo[buf].bufhidden = 'wipe'
       vim.bo[buf].filetype = 'markdown'
       vim.bo[buf].swapfile = false
-      local title = string.format('review: %s:%d-%d', meta.file, meta.line_start, meta.line_end)
+      local prefix = meta.title_prefix or 'review'
+      local title = string.format('%s: %s:%d-%d', prefix, meta.file, meta.line_start, meta.line_end)
       vim.api.nvim_buf_set_name(buf, title)
 
       local width = math.min(80, math.floor(vim.o.columns * 0.7))
@@ -456,6 +485,7 @@ return {
           note = note,
           branch = branch,
           commit = meta.commit,
+          author = 'human',
         }
         if not record then
           vim.notify('arbiter: write failed: ' .. tostring(err), vim.log.levels.ERROR)
@@ -499,6 +529,7 @@ return {
               status = core.normalize_status(r.status),
               preview = preview,
               created_at = r.created_at,
+              n_replies = #core.normalize_comments(r),
             })
           end
         end
@@ -521,7 +552,8 @@ return {
           table.insert(lines, '(no notes)')
         else
           for _, e in ipairs(es) do
-            table.insert(lines, string.format('[%s] %s:%d  %s', e.status, e.file_rel, e.lnum, e.preview))
+            local suffix = (e.n_replies and e.n_replies > 0) and string.format(' (%d replies)', e.n_replies) or ''
+            table.insert(lines, string.format('[%s] %s:%d  %s%s', e.status, e.file_rel, e.lnum, e.preview, suffix))
           end
         end
         return lines
@@ -790,7 +822,9 @@ return {
       if #preview > 60 then
         preview = preview:sub(1, 57) .. '…'
       end
-      return string.format('[%s] %s', core.normalize_status(record.status), preview)
+      local n_replies = #core.normalize_comments(record)
+      local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
+      return string.format('[%s] %s%s', core.normalize_status(record.status), preview, suffix)
     end
 
     local function pick_record_at_cursor(prompt, cb)
@@ -1016,7 +1050,7 @@ return {
     end
 
     function M.preview()
-      local _, matches, _, err = find_records_at_cursor()
+      local all, matches, jsonl_path, err = find_records_at_cursor()
       if err then
         vim.notify('arbiter: ' .. err, vim.log.levels.WARN)
         return
@@ -1025,8 +1059,12 @@ return {
         vim.notify('arbiter: no notes on this line', vim.log.levels.WARN)
         return
       end
+      local function lang_for(file)
+        return file and vim.filetype.match { filename = file } or nil
+      end
       local lines = {}
       local heading_rows = {}
+      local reply_rows = {}
       for i, m in ipairs(matches) do
         local r = m.record
         if i > 1 then
@@ -1037,10 +1075,45 @@ return {
         local status = core.normalize_status(r.status)
         local range = string.format('L%d-%d', r.line_start, r.line_end)
         table.insert(lines, string.format('# [%s] %s · %s', status, range, r.created_at or ''))
-        table.insert(heading_rows, { row = #lines - 1, status = status })
+        table.insert(heading_rows, { row = #lines - 1, status = status, match_idx = i })
         table.insert(lines, '')
         for note_line in (tostring(r.note or '')):gmatch '[^\n]+' do
           table.insert(lines, note_line)
+        end
+        local lang = lang_for(r.file)
+        for _, reply in ipairs(core.normalize_comments(r)) do
+          table.insert(lines, '')
+          table.insert(lines, '')
+          local author = core.normalize_author(reply)
+          local header = string.format('  ↳ %s · %s', author, tostring(reply.created_at or ''))
+          table.insert(lines, header)
+          local header_row = #lines - 1
+          local rule_width = vim.fn.strdisplaywidth(header) - 2
+          if rule_width < 1 then
+            rule_width = 1
+          end
+          table.insert(lines, '  ' .. string.rep('─', rule_width))
+          local rule_row = #lines - 1
+          table.insert(lines, '')
+          table.insert(reply_rows, { author = author, rows = { header_row, rule_row } })
+          local in_fence = false
+          for body_line in (tostring(reply.body or '')):gmatch '[^\n]+' do
+            local fence_open = body_line:match '^```(.*)$'
+            if fence_open and not in_fence then
+              in_fence = true
+              local tag = fence_open:gsub('^%s+', ''):gsub('%s+$', '')
+              if tag == '' and lang then
+                table.insert(lines, '  ```' .. lang)
+              else
+                table.insert(lines, '  ' .. body_line)
+              end
+            elseif body_line:match '^```%s*$' and in_fence then
+              in_fence = false
+              table.insert(lines, '  ' .. body_line)
+            else
+              table.insert(lines, '  ' .. body_line)
+            end
+          end
         end
       end
 
@@ -1052,9 +1125,13 @@ return {
       for _, h in ipairs(heading_rows) do
         highlight_status_line(buf, h.row, h.status)
       end
+      for _, rep in ipairs(reply_rows) do
+        highlight_reply_lines(buf, rep.rows, rep.author)
+      end
 
-      local max_w = math.min(80, math.floor(vim.o.columns * 0.7))
-      local width = 20
+      local source_win_w = vim.api.nvim_win_get_width(0)
+      local max_w = math.max(source_win_w, math.floor(vim.o.columns * 0.7))
+      local width = math.max(source_win_w, 20)
       for _, l in ipairs(lines) do
         if #l > width then
           width = #l
@@ -1064,15 +1141,38 @@ return {
       local height = math.min(#lines + 1, math.floor(vim.o.lines * 0.5))
 
       local source_buf = vim.api.nvim_get_current_buf()
+      local cursor_screen = vim.fn.screenpos(0, vim.fn.line '.', vim.fn.col '.')
+      local anchor_row = (cursor_screen and cursor_screen.row and cursor_screen.row > 0) and cursor_screen.row or math.floor(vim.o.lines / 2)
+      local anchor_col = (cursor_screen and cursor_screen.col and cursor_screen.col > 0) and cursor_screen.col or 0
+      local normal_row = math.min(vim.o.lines - height - 2, anchor_row)
+      local normal_col = math.max(0, math.min(vim.o.columns - width - 2, anchor_col - 1))
+
+      -- Map a 1-indexed cursor row in the preview buffer to a `matches` index
+      -- by walking heading_rows (0-indexed buffer rows) and picking the largest
+      -- heading row <= cursor row - 1. Falls back to match 1 if the cursor is
+      -- above the first heading.
+      local function match_at(cursor_row)
+        local target = cursor_row - 1
+        local picked = 1
+        for _, h in ipairs(heading_rows) do
+          if h.row <= target then
+            picked = h.match_idx
+          else
+            break
+          end
+        end
+        return picked
+      end
+
       local win = vim.api.nvim_open_win(buf, true, {
-        relative = 'cursor',
-        row = 1,
-        col = 0,
+        relative = 'editor',
+        row = normal_row,
+        col = normal_col,
         width = width,
         height = height,
         style = 'minimal',
         border = 'rounded',
-        title = ' arbiter notes (q to close) ',
+        title = ' arbiter notes (q close · m maximize · r reply) ',
         title_pos = 'center',
         focusable = true,
       })
@@ -1086,8 +1186,94 @@ return {
         end
       end
 
+      local maximized = false
+      local function toggle_maximize()
+        if not vim.api.nvim_win_is_valid(win) then
+          return
+        end
+        if maximized then
+          vim.api.nvim_win_set_config(win, {
+            relative = 'editor',
+            row = normal_row,
+            col = normal_col,
+            width = width,
+            height = height,
+            border = 'rounded',
+            title = ' arbiter notes (q close · m maximize · r reply) ',
+            title_pos = 'center',
+          })
+        else
+          local big_w = math.max(20, math.floor(vim.o.columns * 0.95))
+          local big_h = math.max(5, math.floor(vim.o.lines * 0.9))
+          local big_row = math.max(0, math.floor((vim.o.lines - big_h) / 2) - 1)
+          local big_col = math.max(0, math.floor((vim.o.columns - big_w) / 2))
+          vim.api.nvim_win_set_config(win, {
+            relative = 'editor',
+            row = big_row,
+            col = big_col,
+            width = big_w,
+            height = big_h,
+            border = 'rounded',
+            title = ' arbiter notes (q close · m restore · r reply) ',
+            title_pos = 'center',
+          })
+        end
+        maximized = not maximized
+      end
+
+      local function reply()
+        if not vim.api.nvim_win_is_valid(win) then
+          return
+        end
+        local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
+        local mi = match_at(cursor_row)
+        local m = matches[mi]
+        if not m then
+          return
+        end
+        local idx = m.idx
+        local r = m.record
+        local meta = {
+          file = r.file,
+          line_start = r.line_start,
+          line_end = r.line_end,
+          title_prefix = 'reply',
+        }
+        local source_win = vim.fn.bufwinid(source_buf)
+        close()
+        open_note_window(meta, function(body)
+          local _, err2 = core.append_reply(all, idx, { body = body, author = 'human' })
+          if err2 then
+            vim.notify('arbiter: reply failed: ' .. tostring(err2), vim.log.levels.ERROR)
+            return
+          end
+          local ok_w, werr = core.rewrite_jsonl(jsonl_path, all)
+          if not ok_w then
+            vim.notify('arbiter: reply write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+            return
+          end
+          if vim.api.nvim_buf_is_valid(source_buf) then
+            refresh_diagnostics_for_buf(source_buf)
+          end
+          vim.notify('arbiter: reply saved', vim.log.levels.INFO)
+          -- Reopen the preview from the source window so it re-renders with the
+          -- new reply included. open_note_window's BufWriteCmd closes the
+          -- compose window before our callback returns, so focus is on
+          -- whatever window vim returned to — defensively jump back to the
+          -- source window before re-invoking M.preview().
+          vim.schedule(function()
+            if source_win and source_win ~= -1 and vim.api.nvim_win_is_valid(source_win) then
+              vim.api.nvim_set_current_win(source_win)
+              M.preview()
+            end
+          end)
+        end)
+      end
+
       vim.keymap.set('n', 'q', close, { buffer = buf, nowait = true, silent = true })
       vim.keymap.set('n', '<Esc>', close, { buffer = buf, nowait = true, silent = true })
+      vim.keymap.set('n', 'm', toggle_maximize, { buffer = buf, nowait = true, silent = true })
+      vim.keymap.set('n', 'r', reply, { buffer = buf, nowait = true, silent = true })
 
       vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI', 'InsertEnter' }, {
         buffer = source_buf,
@@ -1096,11 +1282,44 @@ return {
       })
     end
 
+    function M.add_reply()
+      local source_bufnr = vim.api.nvim_get_current_buf()
+      pick_record_at_cursor('arbiter: reply to which note?', function(all, idx, jsonl_path)
+        local r = all[idx]
+        local meta = {
+          file = r.file,
+          line_start = r.line_start,
+          line_end = r.line_end,
+          title_prefix = 'reply',
+        }
+        open_note_window(meta, function(body)
+          local reply, err = core.append_reply(all, idx, { body = body, author = 'human' })
+          if not reply then
+            vim.notify('arbiter: reply failed: ' .. tostring(err), vim.log.levels.ERROR)
+            return
+          end
+          local ok_w, werr = core.rewrite_jsonl(jsonl_path, all)
+          if not ok_w then
+            vim.notify('arbiter: reply write failed: ' .. tostring(werr), vim.log.levels.ERROR)
+            return
+          end
+          if vim.api.nvim_buf_is_valid(source_bufnr) then
+            refresh_diagnostics_for_buf(source_bufnr)
+          end
+          vim.notify('arbiter: reply saved', vim.log.levels.INFO)
+        end)
+      end)
+    end
+
     vim.api.nvim_create_user_command('Arbiter', function(opts)
       local s = opts.line1 or vim.fn.line '.'
       local e = opts.line2 or s
       M.add_comment(s, e)
     end, { range = true, desc = 'arbiter: leave review feedback on AI-written code' })
+
+    vim.api.nvim_create_user_command('ArbiterReply', function()
+      M.add_reply()
+    end, { desc = 'arbiter: reply to a note on the current line' })
 
     vim.keymap.set('n', '<leader>gr', function()
       local l = vim.fn.line '.'
@@ -1195,6 +1414,10 @@ return {
     vim.keymap.set('n', '<leader>gp', function()
       M.preview()
     end, { desc = 'arbiter: [P]review notes on current line in floating window' })
+
+    vim.keymap.set('n', '<leader>gR', function()
+      M.add_reply()
+    end, { desc = 'arbiter: [R]eply to note on current line' })
 
     local diag_group = vim.api.nvim_create_augroup('ArbiterDiagnostics', { clear = true })
     vim.api.nvim_create_autocmd({ 'BufReadPost', 'BufEnter' }, {

@@ -109,6 +109,8 @@ local function parse_args(argv)
       opts.commit = v
     elseif a == '--commit-null' then
       opts.commit_null = true
+    elseif a == '--author' then
+      opts.author = need '--author'
     elseif a == '--grep' then
       opts.grep = need '--grep'
     elseif a == '--grep-regex' then
@@ -244,7 +246,9 @@ local function cmd_list(opts)
     local file = tostring(r.file or '?')
     local ls = tonumber(r.line_start) or 0
     local le = tonumber(r.line_end) or ls
-    io.write(string.format('%s  [%s]  %s:%d-%d  %s\n', id, status, file, ls, le, preview(r.note, 80)))
+    local n_replies = #core.normalize_comments(r)
+    local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
+    io.write(string.format('%s  [%s]  %s:%d-%d  %s%s\n', id, status, file, ls, le, preview(r.note, 80), suffix))
   end
   return 0
 end
@@ -258,6 +262,7 @@ local function format_show(record, want_json)
   local lines = {
     string.format('id:         %s', id),
     string.format('status:     %s', status),
+    string.format('author:     %s', core.normalize_author(record)),
     string.format('file:       %s', tostring(record.file or '?')),
     string.format('lines:      %d-%d', tonumber(record.line_start) or 0, tonumber(record.line_end) or 0),
     string.format(
@@ -273,6 +278,18 @@ local function format_show(record, want_json)
     'note:',
     tostring(record.note or ''),
   }
+  local replies = core.normalize_comments(record)
+  if #replies > 0 then
+    table.insert(lines, '')
+    table.insert(lines, string.format('replies (%d):', #replies))
+    for _, reply in ipairs(replies) do
+      table.insert(lines, '')
+      table.insert(lines, string.format('  ↳ %s · %s', core.normalize_author(reply), tostring(reply.created_at or '')))
+      for body_line in (tostring(reply.body or '')):gmatch '[^\n]+' do
+        table.insert(lines, '  > ' .. body_line)
+      end
+    end
+  end
   return table.concat(lines, '\n')
 end
 
@@ -493,6 +510,34 @@ local function cmd_add(opts)
   return 0
 end
 
+local function cmd_reply(opts)
+  local id = opts[2]
+  if not id or id == '' then
+    die 'usage: arbiter reply <id> [--author <name>] < body'
+  end
+  local body = io.read '*a' or ''
+  body = body:gsub('\n+$', '')
+  if body == '' then
+    die 'no reply body on stdin — pipe a body or redirect from a file'
+  end
+  local ctx = setup(opts)
+  local records = core.read_jsonl(ctx.jsonl)
+  local idx = core.find_by_id(records, id, ctx.branch)
+  if not idx then
+    die("no note with id " .. id .. " on branch " .. (ctx.branch or '<unknown>'), 5)
+  end
+  local reply, rerr = core.append_reply(records, idx, { author = opts.author or 'ai', body = body })
+  if not reply then
+    die('reply failed: ' .. tostring(rerr), 1)
+  end
+  local ok_w, werr = core.rewrite_jsonl(ctx.jsonl, records)
+  if not ok_w then
+    die('write failed: ' .. tostring(werr), 6)
+  end
+  io.write(string.format('arbiter: replied to %s (%s)\n', id, core.normalize_author(reply)))
+  return 0
+end
+
 -- =====================================================================
 -- Help / dispatch.
 -- =====================================================================
@@ -507,6 +552,7 @@ USAGE
   arbiter resolve <id>
   arbiter add <file> <line-or-range> [--commit <sha> | --commit-null]
               < note-body
+  arbiter reply <id> [--author <name>] < body
 
 LIST FILTERS  (combine; AND together)
   --status <list>        comma-separated statuses. default: pending,needs-rereview
@@ -532,6 +578,13 @@ ADD
     --commit <sha>      override commit. default: short HEAD sha, or null.
     --commit-null       force commit=null even if HEAD resolves.
     Prints the new record's id on success.
+
+REPLY
+  arbiter reply <id>
+    Read a reply body from stdin and append it to the note's `comments`.
+    --author <name>     author of the reply. default: 'ai'. Free-form;
+                        use this to identify the agent (e.g. 'claude-opus').
+                        Never write 'human' from the CLI.
 
 NOTES
   Patterns are Lua patterns (%a, %d, %s, %.) — not PCRE. No alternation;
@@ -578,6 +631,8 @@ local function main(argv)
     return cmd_resolve(opts)
   elseif cmd == 'add' then
     return cmd_add(opts)
+  elseif cmd == 'reply' then
+    return cmd_reply(opts)
   else
     io.stderr:write("arbiter: unknown subcommand '" .. cmd .. "'\n")
     io.stderr:write(USAGE)

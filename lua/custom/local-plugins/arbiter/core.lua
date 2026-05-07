@@ -135,6 +135,32 @@ function M.normalize_status(s)
   return 'pending'
 end
 
+-- Read-side default: a missing/null/non-table `comments` field reads as no
+-- replies. Lazy-init on first append (see `append_reply`) keeps the on-disk
+-- representation free of empty arrays — cjson encodes `{}` as a JSON object.
+function M.normalize_comments(record)
+  local c = record and record.comments
+  if c == nil or c == M.NULL or type(c) ~= 'table' then
+    return {}
+  end
+  return c
+end
+
+-- Read-side default: missing/null/empty author reads as `"human"` (matches
+-- the historical contract — old records have no author and were all written
+-- by the human-side plugin).
+function M.normalize_author(entry)
+  local a = entry and entry.author
+  if a == nil or a == M.NULL then
+    return 'human'
+  end
+  local s = tostring(a)
+  if s == '' then
+    return 'human'
+  end
+  return s
+end
+
 -- =====================================================================
 -- SHA-1 in pure Lua (used for the 8-char record id). Compact, no deps.
 -- Adapted from public-domain references; produces the same hex digest as
@@ -353,12 +379,43 @@ function M.create_note(opts)
     note = opts.note,
     created_at = M.iso8601_now(),
     status = 'pending',
+    author = opts.author or 'human',
   }
   local ok, err = M.append_jsonl(opts.jsonl_path, record)
   if not ok then
     return nil, err
   end
   return record, nil
+end
+
+-- Append a reply to records[idx]. Pure mutation — caller invokes
+-- `rewrite_jsonl` afterward to persist. Lazy-initializes `comments` on first
+-- reply so notes without replies never carry an empty array on disk (cjson
+-- encodes `{}` as a JSON object, which would break the schema).
+function M.append_reply(records, idx, opts)
+  local record = records and records[idx]
+  if type(record) ~= 'table' then
+    return nil, 'no record at index ' .. tostring(idx)
+  end
+  opts = opts or {}
+  local body = opts.body
+  if type(body) ~= 'string' then
+    return nil, 'reply body must be a string'
+  end
+  body = body:gsub('\n+$', '')
+  if body == '' then
+    return nil, 'empty reply body'
+  end
+  local reply = {
+    author = opts.author or 'ai',
+    body = body,
+    created_at = M.iso8601_now(),
+  }
+  if record.comments == nil or record.comments == M.NULL or type(record.comments) ~= 'table' then
+    record.comments = {}
+  end
+  table.insert(record.comments, reply)
+  return reply, nil
 end
 
 function M.rewrite_jsonl(path, records)

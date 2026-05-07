@@ -20,6 +20,7 @@ arbiter show <id> [--json]
 arbiter set-status <id> <pending|in-progress|needs-rereview|resolved>
 arbiter resolve <id>
 arbiter add <file> <line-or-range> [--commit <sha> | --commit-null] < note-body
+arbiter reply <id> [--author <name>] < reply-body
 ```
 
 `arbiter --help` has the full filter list and exit-code taxonomy. The CLI must run from inside a git repo; `arbiter list` defaults to actionable notes (`pending` + `needs-rereview`) on the current branch.

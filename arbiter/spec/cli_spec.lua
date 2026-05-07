@@ -610,6 +610,101 @@ describe('CLI add', function()
   end)
 end)
 
+describe('CLI reply', function()
+  it('appends a reply with default author=ai, exit 0', function()
+    local dir = setup_repo 'feature'
+    local jsonl = write_jsonl(dir, fixture 'feature')
+    local list_json = run_in(dir, 'list --json')
+    local id = core.cjson.decode(list_json)[1].id
+    local out, _, exit = run_in_with_stdin(dir, 'reply ' .. id, 'first AI reply')
+    assert.equals(0, exit)
+    assert.is_truthy(out:find('replied to ' .. id, 1, true))
+    assert.is_truthy(out:find('(ai)', 1, true))
+    local recs = core.read_jsonl(jsonl)
+    teardown(dir)
+    local target
+    for _, r in ipairs(recs) do
+      if core.record_id(r) == id then target = r end
+    end
+    assert.is_table(target)
+    local replies = core.normalize_comments(target)
+    assert.equals(1, #replies)
+    assert.equals('ai', replies[1].author)
+    assert.equals('first AI reply', replies[1].body)
+    assert.is_string(replies[1].created_at)
+  end)
+
+  it('--author override surfaces in list --json', function()
+    local dir = setup_repo 'feature'
+    write_jsonl(dir, fixture 'feature')
+    local list_json = run_in(dir, 'list --json')
+    local id = core.cjson.decode(list_json)[1].id
+    local _, _, exit = run_in_with_stdin(dir, 'reply ' .. id .. ' --author claude-opus', 'named')
+    assert.equals(0, exit)
+    local out2 = run_in(dir, 'list --json')
+    teardown(dir)
+    local arr = core.cjson.decode(out2)
+    local target
+    for _, r in ipairs(arr) do
+      if r.id == id then target = r end
+    end
+    assert.is_table(target)
+    assert.is_table(target.comments)
+    assert.equals(1, #target.comments)
+    assert.equals('claude-opus', target.comments[1].author)
+    assert.equals('named', target.comments[1].body)
+  end)
+
+  it('bad id → exit 5', function()
+    local dir = setup_repo 'feature'
+    write_jsonl(dir, fixture 'feature')
+    local _, err, exit = run_in_with_stdin(dir, 'reply deadbeef', 'body')
+    teardown(dir)
+    assert.equals(5, exit)
+    assert.is_truthy(err:find 'no note with id deadbeef')
+  end)
+
+  it('no jsonl → exit 4', function()
+    local dir = setup_repo 'feature'
+    local _, err, exit = run_in_with_stdin(dir, 'reply abcdef12', 'body')
+    teardown(dir)
+    assert.equals(4, exit)
+    assert.is_truthy(err:find 'arbiter not in use here')
+  end)
+
+  it('empty stdin → exit 1', function()
+    local dir = setup_repo 'feature'
+    write_jsonl(dir, fixture 'feature')
+    local list_json = run_in(dir, 'list --json')
+    local id = core.cjson.decode(list_json)[1].id
+    local _, err, exit = run_in(dir, 'reply ' .. id)
+    teardown(dir)
+    assert.equals(1, exit)
+    assert.is_truthy(err:find 'no reply body on stdin')
+  end)
+
+  it('parent id is stable before and after reply', function()
+    local dir = setup_repo 'feature'
+    write_jsonl(dir, fixture 'feature')
+    local list_json = run_in(dir, 'list --json')
+    local id_before = core.cjson.decode(list_json)[1].id
+    local _, _, exit = run_in_with_stdin(dir, 'reply ' .. id_before, 'r')
+    assert.equals(0, exit)
+    local list_json2 = run_in(dir, 'list --json')
+    teardown(dir)
+    local arr = core.cjson.decode(list_json2)
+    -- The same record (file/line_start/branch/created_at) keeps its id; replies
+    -- aren't part of the hash inputs.
+    local found
+    for _, r in ipairs(arr) do
+      if r.id == id_before then found = r end
+    end
+    assert.is_table(found)
+    assert.is_table(found.comments)
+    assert.equals(1, #found.comments)
+  end)
+end)
+
 describe('cross-branch isolation', function()
   it("mutating on branch A leaves branch-B records' decoded value identical", function()
     local dir = setup_repo 'feature'
