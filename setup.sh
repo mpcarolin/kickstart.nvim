@@ -18,3 +18,6 @@ sudo apt install luarocks -y
 
 # clone the kickstart
 git clone https://github.com/mpcarolin/kickstart.nvim "$NVIM_DIR"
+
+# arbiter CLI: see arbiter/setup.sh for details.
+bash "$NVIM_DIR/arbiter/setup.sh"
