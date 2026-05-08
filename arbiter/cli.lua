@@ -244,11 +244,17 @@ local function cmd_list(opts)
     local id = core.record_id(r)
     local status = core.normalize_status(r.status)
     local file = tostring(r.file or '?')
-    local ls = tonumber(r.line_start) or 0
-    local le = tonumber(r.line_end) or ls
     local n_replies = #core.normalize_comments(r)
     local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
-    io.write(string.format('%s  [%s]  %s:%d-%d  %s%s\n', id, status, file, ls, le, preview(r.note, 80), suffix))
+    local locator
+    if r.scope == 'file' or type(r.line_start) ~= 'number' then
+      locator = file .. ' [file]'
+    else
+      local ls = tonumber(r.line_start) or 0
+      local le = tonumber(r.line_end) or ls
+      locator = string.format('%s:%d-%d', file, ls, le)
+    end
+    io.write(string.format('%s  [%s]  %s  %s%s\n', id, status, locator, preview(r.note, 80), suffix))
   end
   return 0
 end
@@ -259,12 +265,18 @@ local function format_show(record, want_json)
   end
   local id = core.record_id(record)
   local status = core.normalize_status(record.status)
+  local lines_str
+  if record.scope == 'file' or type(record.line_start) ~= 'number' then
+    lines_str = '(file-level)'
+  else
+    lines_str = string.format('%d-%d', tonumber(record.line_start) or 0, tonumber(record.line_end) or 0)
+  end
   local lines = {
     string.format('id:         %s', id),
     string.format('status:     %s', status),
     string.format('author:     %s', core.normalize_author(record)),
     string.format('file:       %s', tostring(record.file or '?')),
-    string.format('lines:      %d-%d', tonumber(record.line_start) or 0, tonumber(record.line_end) or 0),
+    string.format('lines:      %s', lines_str),
     string.format(
       'commit:     %s',
       (record.commit == nil or record.commit == core.NULL) and '(none)' or tostring(record.commit)
@@ -377,25 +389,30 @@ local function cmd_add(opts)
 
   local file_arg = opts[2]
   local range_arg = opts[3]
-  if not file_arg or file_arg == '' or not range_arg or range_arg == '' then
-    die 'usage: arbiter add <file> <line-or-range> < note-body'
+  if not file_arg or file_arg == '' then
+    die 'usage: arbiter add <file> [<line-or-range>] < note-body'
   end
 
-  -- Parse line range.
+  -- Parse line range. Absent / empty range → file-level note.
   local line_start, line_end
-  local single = range_arg:match '^(%d+)$'
-  if single then
-    line_start = tonumber(single)
-    line_end = line_start
+  if range_arg == nil or range_arg == '' then
+    line_start = nil
+    line_end = nil
   else
-    local lo, hi = range_arg:match '^(%d+)%-(%d+)$'
-    if not lo then
-      die("invalid line range: " .. range_arg)
-    end
-    line_start = tonumber(lo)
-    line_end = tonumber(hi)
-    if line_start > line_end then
-      die("invalid line range: " .. range_arg)
+    local single = range_arg:match '^(%d+)$'
+    if single then
+      line_start = tonumber(single)
+      line_end = line_start
+    else
+      local lo, hi = range_arg:match '^(%d+)%-(%d+)$'
+      if not lo then
+        die("invalid line range: " .. range_arg)
+      end
+      line_start = tonumber(lo)
+      line_end = tonumber(hi)
+      if line_start > line_end then
+        die("invalid line range: " .. range_arg)
+      end
     end
   end
 
@@ -465,13 +482,15 @@ local function cmd_add(opts)
     die 'file is outside the repo'
   end
 
-  -- Line bounds.
-  local total = count_lines(resolved)
-  if total == nil then
-    die('no such file: ' .. file_arg)
-  end
-  if line_end > total then
-    die(string.format('line %d is past end of file (%d lines)', line_end, total))
+  -- Line bounds (range notes only).
+  if line_end ~= nil then
+    local total = count_lines(resolved)
+    if total == nil then
+      die('no such file: ' .. file_arg)
+    end
+    if line_end > total then
+      die(string.format('line %d is past end of file (%d lines)', line_end, total))
+    end
   end
 
   -- Resolve commit.
@@ -492,11 +511,26 @@ local function cmd_add(opts)
     die('cannot resolve jsonl path', 3)
   end
 
+  -- Capture an anchor for range notes by reading the file from disk.
+  local anchor
+  if line_start ~= nil then
+    local f = io.open(resolved, 'r')
+    if f then
+      local file_lines = {}
+      for ln in f:lines() do
+        table.insert(file_lines, ln)
+      end
+      f:close()
+      anchor = core.build_anchor(file_lines, line_start, line_end)
+    end
+  end
+
   local record, err = core.create_note {
     jsonl_path = jsonl,
     file = rel,
     line_start = line_start,
     line_end = line_end,
+    anchor = anchor,
     note = body,
     branch = branch,
     commit = commit,
@@ -550,7 +584,7 @@ USAGE
   arbiter show <id> [--json]
   arbiter set-status <id> <pending|in-progress|needs-rereview|resolved>
   arbiter resolve <id>
-  arbiter add <file> <line-or-range> [--commit <sha> | --commit-null]
+  arbiter add <file> [<line-or-range>] [--commit <sha> | --commit-null]
               < note-body
   arbiter reply <id> [--author <name>] < body
 
@@ -572,9 +606,10 @@ LIST FILTERS  (combine; AND together)
   --json                 emit JSON array (full records + synthetic `id`)
 
 ADD
-  arbiter add <file> <line-or-range>
+  arbiter add <file> [<line-or-range>]
     Read the note body from stdin and append a new pending record.
-    <line-or-range>     1-indexed: '42' or '42-47' (inclusive).
+    <line-or-range>     1-indexed: '42' or '42-47' (inclusive). Omit
+                        to create a file-level note (no line range).
     --commit <sha>      override commit. default: short HEAD sha, or null.
     --commit-null       force commit=null even if HEAD resolves.
     Prints the new record's id on success.

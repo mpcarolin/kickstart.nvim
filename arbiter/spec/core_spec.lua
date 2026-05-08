@@ -552,3 +552,310 @@ describe('apply_filters', function()
     assert.equals(2, #out) -- a + c
   end)
 end)
+
+describe('build_anchor', function()
+  local buf = { 'A', 'B', 'C', 'D', 'E', 'F', 'G' }
+
+  it('captures lines and 3-line context windows', function()
+    local a = core.build_anchor(buf, 3, 5)
+    assert.same({ 'C', 'D', 'E' }, a.lines)
+    assert.same({ 'A', 'B' }, a.ctx_before) -- only 2 lines before line 3 (1, 2)
+    assert.same({ 'F', 'G' }, a.ctx_after) -- only 2 lines after line 5 (6, 7)
+  end)
+
+  it('caps ctx_before / ctx_after at 3 lines', function()
+    local big = {}
+    for i = 1, 20 do
+      big[i] = 'L' .. i
+    end
+    local a = core.build_anchor(big, 10, 11)
+    assert.equals(3, #a.ctx_before)
+    assert.same({ 'L7', 'L8', 'L9' }, a.ctx_before)
+    assert.equals(3, #a.ctx_after)
+    assert.same({ 'L12', 'L13', 'L14' }, a.ctx_after)
+  end)
+
+  it('empty ctx_before at top of file', function()
+    local a = core.build_anchor(buf, 1, 2)
+    assert.same({}, a.ctx_before)
+    assert.same({ 'A', 'B' }, a.lines)
+  end)
+
+  it('empty ctx_after at bottom of file', function()
+    local a = core.build_anchor(buf, 6, 7)
+    assert.same({ 'F', 'G' }, a.lines)
+    assert.same({}, a.ctx_after)
+  end)
+
+  it('normalizes captured lines (strips leading/trailing ws, collapses runs)', function()
+    local a = core.build_anchor({ 'foo   bar  ', '  baz   qux ' }, 1, 2)
+    assert.same({ 'foo bar', 'baz qux' }, a.lines)
+  end)
+end)
+
+describe('create_note (anchor + file-level)', function()
+  it('range note stores anchor when provided', function()
+    local p = os.tmpname()
+    local rec = core.create_note {
+      jsonl_path = p,
+      file = 'a.lua',
+      line_start = 2,
+      line_end = 4,
+      note = 'x',
+      branch = 'm',
+      anchor = { lines = { 'B', 'C', 'D' }, ctx_before = { 'A' }, ctx_after = { 'E' } },
+    }
+    local read = core.read_jsonl(p)
+    os.remove(p)
+    assert.equals('range', read[1].scope)
+    assert.same({ 'B', 'C', 'D' }, read[1].anchor.lines)
+    assert.same({ 'A' }, read[1].anchor.ctx_before)
+    assert.same({ 'E' }, read[1].anchor.ctx_after)
+    assert.equals(2, rec.line_start)
+  end)
+
+  it('file-level note: nil line_start/line_end → scope=file, JSON nulls', function()
+    local p = os.tmpname()
+    local rec, err = core.create_note {
+      jsonl_path = p,
+      file = 'a.lua',
+      line_start = nil,
+      line_end = nil,
+      note = 'whole-file',
+      branch = 'm',
+    }
+    assert.is_nil(err)
+    assert.equals('file', rec.scope)
+    assert.equals(core.NULL, rec.line_start)
+    assert.equals(core.NULL, rec.line_end)
+    local raw = io.open(p, 'r'):read '*a'
+    local read = core.read_jsonl(p)
+    os.remove(p)
+    assert.is_truthy(raw:find '"line_start":null')
+    assert.is_truthy(raw:find '"line_end":null')
+    assert.is_truthy(raw:find '"scope":"file"')
+    assert.equals('file', read[1].scope)
+    assert.is_nil(read[1].anchor)
+  end)
+
+  it('errors when only one of line_start/line_end is set', function()
+    local p = os.tmpname()
+    local rec, err = core.create_note {
+      jsonl_path = p,
+      file = 'a.lua',
+      line_start = 1,
+      line_end = nil,
+      note = 'x',
+    }
+    os.remove(p)
+    assert.is_nil(rec)
+    assert.is_string(err)
+  end)
+
+  it('errors on negative or zero line numbers', function()
+    local p = os.tmpname()
+    local r1, e1 = core.create_note {
+      jsonl_path = p, file = 'a.lua', line_start = 0, line_end = 0, note = 'x',
+    }
+    os.remove(p)
+    assert.is_nil(r1)
+    assert.is_string(e1)
+  end)
+
+  it('errors when line_start > line_end', function()
+    local p = os.tmpname()
+    local r, e = core.create_note {
+      jsonl_path = p, file = 'a.lua', line_start = 5, line_end = 2, note = 'x',
+    }
+    os.remove(p)
+    assert.is_nil(r)
+    assert.is_string(e)
+  end)
+
+  it('legacy passthrough: hand-crafted JSONL with no scope/anchor round-trips', function()
+    local p = os.tmpname()
+    local f = io.open(p, 'w')
+    f:write('{"file":"a.lua","line_start":3,"line_end":5,"note":"legacy","branch":"m","status":"pending","created_at":"t"}\n')
+    f:close()
+    local read = core.read_jsonl(p)
+    os.remove(p)
+    assert.equals(1, #read)
+    assert.is_nil(read[1].scope)
+    assert.is_nil(read[1].anchor)
+    assert.equals(3, read[1].line_start)
+  end)
+end)
+
+describe('resolve_anchor', function()
+  local function range_record(opts)
+    return {
+      file = 'a.lua',
+      line_start = opts.line_start,
+      line_end = opts.line_end,
+      anchor = opts.anchor,
+      scope = 'range',
+    }
+  end
+
+  it('legacy record (no anchor) returns stored lines, drift=none', function()
+    local r = { file = 'a.lua', line_start = 3, line_end = 5 }
+    local out = core.resolve_anchor(r, { 'A', 'B', 'C', 'D', 'E' })
+    assert.equals('none', out.drift)
+    assert.equals(3, out.line_start)
+    assert.equals(5, out.line_end)
+  end)
+
+  it('file-level record returns drift=file, nil line numbers', function()
+    local r = { file = 'a.lua', scope = 'file', line_start = core.NULL, line_end = core.NULL }
+    local out = core.resolve_anchor(r, { 'A', 'B' })
+    assert.equals('file', out.drift)
+    assert.is_nil(out.line_start)
+    assert.is_nil(out.line_end)
+  end)
+
+  it('exact match at original position → drift=none', function()
+    local r = range_record {
+      line_start = 2, line_end = 4,
+      anchor = { lines = { 'B', 'C', 'D' }, ctx_before = { 'A' }, ctx_after = { 'E' } },
+    }
+    local out = core.resolve_anchor(r, { 'A', 'B', 'C', 'D', 'E' })
+    assert.equals('none', out.drift)
+    assert.equals(2, out.line_start)
+    assert.equals(4, out.line_end)
+  end)
+
+  it('shift +2 (two lines inserted above) → drift=shifted, new range', function()
+    local r = range_record {
+      line_start = 2, line_end = 4,
+      anchor = { lines = { 'B', 'C', 'D' }, ctx_before = { 'A' }, ctx_after = { 'E' } },
+    }
+    local out = core.resolve_anchor(r, { 'X0', 'X1', 'A', 'B', 'C', 'D', 'E' })
+    assert.equals('shifted', out.drift)
+    assert.equals(4, out.line_start)
+    assert.equals(6, out.line_end)
+  end)
+
+  it('shift -3 (three lines deleted above) → drift=shifted, new range', function()
+    local r = range_record {
+      line_start = 5, line_end = 7,
+      anchor = { lines = { 'B', 'C', 'D' }, ctx_before = { 'A' }, ctx_after = { 'E' } },
+    }
+    local out = core.resolve_anchor(r, { 'A', 'B', 'C', 'D', 'E' })
+    assert.equals('shifted', out.drift)
+    assert.equals(2, out.line_start)
+    assert.equals(4, out.line_end)
+  end)
+
+  it('whitespace-only reformat → drift=shifted via normalization', function()
+    local r = range_record {
+      line_start = 2, line_end = 4,
+      anchor = { lines = { 'foo bar', 'baz', 'qux' }, ctx_before = { 'top' }, ctx_after = { 'bot' } },
+    }
+    -- Re-indent + trailing spaces shifted +1: anchor was at lines 2-4 originally,
+    -- now (with 'pad' inserted at top) the body sits at lines 3-5.
+    local out = core.resolve_anchor(r, { 'pad', 'top', '  foo   bar  ', '  baz   ', '   qux', 'bot' })
+    assert.equals('shifted', out.drift)
+    assert.equals(3, out.line_start)
+    assert.equals(5, out.line_end)
+  end)
+
+  it('anchor body deleted → drift=lost, original lines preserved', function()
+    local r = range_record {
+      line_start = 2, line_end = 4,
+      anchor = { lines = { 'B', 'C', 'D' }, ctx_before = { 'A' }, ctx_after = { 'E' } },
+    }
+    -- Body is gone; surrounding lines unrelated.
+    local out = core.resolve_anchor(r, { 'A', 'X', 'Y', 'Z', 'E' })
+    assert.equals('lost', out.drift)
+    assert.equals(2, out.line_start)
+    assert.equals(4, out.line_end)
+  end)
+
+  it('two near-identical copies: tie-break picks closer to stored line_start', function()
+    local r = range_record {
+      line_start = 5, line_end = 7,
+      anchor = { lines = { 'X', 'Y', 'Z' }, ctx_before = {}, ctx_after = {} },
+    }
+    -- Buffer has the body at lines 4-6 and 9-11. Stored line_start = 5.
+    -- Distance: 4→5 = 1. 9→5 = 4. Closer one wins.
+    local buf = { 'a', 'a', 'a', 'X', 'Y', 'Z', 'a', 'a', 'X', 'Y', 'Z' }
+    local out = core.resolve_anchor(r, buf)
+    assert.equals('shifted', out.drift)
+    assert.equals(4, out.line_start)
+    assert.equals(6, out.line_end)
+  end)
+
+  it('partial overwrite below 70% threshold → drift=lost', function()
+    local r = range_record {
+      line_start = 2, line_end = 6,
+      anchor = { lines = { 'A', 'B', 'C', 'D', 'E' }, ctx_before = {}, ctx_after = {} },
+    }
+    -- Only 1 of 5 body lines remains anywhere — well below threshold 0.7*5 = 4.
+    local out = core.resolve_anchor(r, { 'top', 'A', 'X', 'Y', 'Z', 'W', 'bot' })
+    assert.equals('lost', out.drift)
+  end)
+
+  it('empty ctx_before at file edge does not crash', function()
+    local r = range_record {
+      line_start = 1, line_end = 2,
+      anchor = { lines = { 'A', 'B' }, ctx_before = {}, ctx_after = { 'C' } },
+    }
+    local out = core.resolve_anchor(r, { 'A', 'B', 'C' })
+    assert.equals('none', out.drift)
+  end)
+
+  it('empty ctx_after at file edge does not crash', function()
+    local r = range_record {
+      line_start = 4, line_end = 5,
+      anchor = { lines = { 'D', 'E' }, ctx_before = { 'C' }, ctx_after = {} },
+    }
+    local out = core.resolve_anchor(r, { 'A', 'B', 'C', 'D', 'E' })
+    assert.equals('none', out.drift)
+  end)
+
+  it('CRLF in stored anchor vs LF in buffer treated as equivalent', function()
+    local r = range_record {
+      line_start = 1, line_end = 2,
+      anchor = { lines = { 'foo\r', 'bar\r' }, ctx_before = {}, ctx_after = {} },
+    }
+    local out = core.resolve_anchor(r, { 'foo', 'bar' })
+    assert.equals('none', out.drift)
+  end)
+
+  it('does not mutate the input record on shifted resolution', function()
+    local anchor = { lines = { 'B', 'C', 'D' }, ctx_before = { 'A' }, ctx_after = { 'E' } }
+    local r = range_record { line_start = 2, line_end = 4, anchor = anchor }
+    local out = core.resolve_anchor(r, { 'X0', 'X1', 'A', 'B', 'C', 'D', 'E' })
+    assert.equals('shifted', out.drift)
+    -- Record fields untouched.
+    assert.equals(2, r.line_start)
+    assert.equals(4, r.line_end)
+    assert.same({ 'B', 'C', 'D' }, r.anchor.lines)
+    assert.same({ 'A' }, r.anchor.ctx_before)
+    assert.same({ 'E' }, r.anchor.ctx_after)
+  end)
+
+  it('blob fast path: matching blob short-circuits to drift=none', function()
+    local r = range_record {
+      line_start = 2, line_end = 4,
+      anchor = { lines = { 'B', 'C', 'D' }, ctx_before = {}, ctx_after = {}, blob = 'abcd1234' },
+    }
+    -- Buffer disagrees with stored lines, but blob matches → trust stored.
+    local out = core.resolve_anchor(r, { 'X', 'Y', 'Z', 'W', 'V' }, 'abcd1234')
+    assert.equals('none', out.drift)
+    assert.equals(2, out.line_start)
+    assert.equals(4, out.line_end)
+  end)
+end)
+
+describe('filter_for_branch with file-level notes', function()
+  it('file-level notes filter by branch like range notes', function()
+    local recs = {
+      { file = 'a', branch = 'master', scope = 'file', line_start = core.NULL, line_end = core.NULL },
+      { file = 'b', branch = 'feature', scope = 'file', line_start = core.NULL, line_end = core.NULL },
+      { file = 'c', branch = core.NULL, scope = 'file', line_start = core.NULL, line_end = core.NULL },
+    }
+    local out = core.filter_for_branch(recs, 'master')
+    assert.equals(2, #out) -- a + c
+  end)
+end)

@@ -369,23 +369,252 @@ end
 -- Build a pending record from already-validated inputs and append it to the
 -- JSONL. nil/absent commit/branch collapse to JSON null. Returns the record on
 -- success so the caller can run record_id() on it.
+--
+-- Two shapes:
+--   range note: opts.line_start and opts.line_end are positive ints,
+--               line_start <= line_end. opts.anchor (optional) captures a
+--               normalized snapshot of the lines + 3 surrounding lines so
+--               drift can be re-resolved on read (see `resolve_anchor`).
+--   file note:  both opts.line_start and opts.line_end are nil. Record is
+--               written with `scope = "file"` and JSON-null line numbers.
 function M.create_note(opts)
+  local has_start = opts.line_start ~= nil
+  local has_end = opts.line_end ~= nil
+  if has_start ~= has_end then
+    return nil, 'line_start and line_end must both be set or both be nil'
+  end
+  local scope
+  if not has_start then
+    scope = 'file'
+  else
+    if type(opts.line_start) ~= 'number' or type(opts.line_end) ~= 'number' then
+      return nil, 'line_start and line_end must be numbers'
+    end
+    if opts.line_start < 1 or opts.line_end < 1 then
+      return nil, 'line numbers must be positive'
+    end
+    if opts.line_start > opts.line_end then
+      return nil, 'line_start must be <= line_end'
+    end
+    scope = 'range'
+  end
   local record = {
     file = opts.file,
-    line_start = opts.line_start,
-    line_end = opts.line_end,
+    line_start = has_start and opts.line_start or M.NULL,
+    line_end = has_end and opts.line_end or M.NULL,
     commit = opts.commit == nil and M.NULL or opts.commit,
     branch = opts.branch == nil and M.NULL or opts.branch,
     note = opts.note,
     created_at = M.iso8601_now(),
     status = 'pending',
     author = opts.author or 'human',
+    scope = scope,
   }
+  if scope == 'range' and opts.anchor ~= nil then
+    record.anchor = opts.anchor
+  end
   local ok, err = M.append_jsonl(opts.jsonl_path, record)
   if not ok then
     return nil, err
   end
   return record, nil
+end
+
+-- =====================================================================
+-- Anchor capture & drift resolution.
+--
+-- An anchor is a content snapshot taken at note creation time:
+--   { lines = {...}, ctx_before = {...}, ctx_after = {...}, blob = "<sha>"? }
+-- It lets us re-locate a note when surrounding edits shift line numbers,
+-- without ever rewriting the JSONL on disk in Phase A.
+-- =====================================================================
+
+-- Normalize a line for anchor comparison: strip CR, strip leading and
+-- trailing whitespace, collapse runs of internal whitespace to a single space.
+-- This tolerates trivial reformatting (re-indentation, trailing spaces)
+-- without enabling false matches across genuinely different code.
+function M.normalize_anchor_line(s)
+  if type(s) ~= 'string' then
+    return ''
+  end
+  s = s:gsub('\r', '')
+  s = s:gsub('^%s+', '')
+  s = s:gsub('%s+$', '')
+  s = s:gsub('%s+', ' ')
+  return s
+end
+
+local function normalize_list(list)
+  local out = {}
+  if type(list) ~= 'table' then
+    return out
+  end
+  for i, l in ipairs(list) do
+    out[i] = M.normalize_anchor_line(l)
+  end
+  return out
+end
+
+-- Build an anchor table from `buf_lines` (1-indexed array of strings) given
+-- the range [line_start..line_end]. Up to 3 lines of context above/below.
+-- Returns a table suitable for passing as `opts.anchor` to `create_note`.
+function M.build_anchor(buf_lines, line_start, line_end, blob)
+  local anchor = { lines = {}, ctx_before = {}, ctx_after = {} }
+  if type(buf_lines) ~= 'table' then
+    return anchor
+  end
+  for i = line_start, line_end do
+    table.insert(anchor.lines, M.normalize_anchor_line(buf_lines[i] or ''))
+  end
+  for i = math.max(1, line_start - 3), line_start - 1 do
+    table.insert(anchor.ctx_before, M.normalize_anchor_line(buf_lines[i] or ''))
+  end
+  for i = line_end + 1, math.min(#buf_lines, line_end + 3) do
+    table.insert(anchor.ctx_after, M.normalize_anchor_line(buf_lines[i] or ''))
+  end
+  if blob and blob ~= '' then
+    anchor.blob = blob
+  end
+  return anchor
+end
+
+-- Compare two normalized line lists. Returns the count of positions where
+-- they match exactly. Operates on already-normalized strings.
+local function exact_line_matches(a, b)
+  if type(a) ~= 'table' or type(b) ~= 'table' then
+    return 0
+  end
+  local n = math.min(#a, #b)
+  local matches = 0
+  for i = 1, n do
+    if a[i] == b[i] then
+      matches = matches + 1
+    end
+  end
+  return matches
+end
+
+-- Slice a list into a new array [from..to] (inclusive). Out-of-bounds indices
+-- are clamped to the list bounds; the returned slice is empty if the range
+-- is entirely outside the list.
+local function slice(list, from, to)
+  local out = {}
+  if type(list) ~= 'table' then
+    return out
+  end
+  from = math.max(1, from)
+  to = math.min(#list, to)
+  for i = from, to do
+    table.insert(out, list[i])
+  end
+  return out
+end
+
+-- Resolve an anchor against the current buffer contents. Pure: never mutates
+-- `record`. Returns a result table:
+--   { line_start = N|nil, line_end = N|nil, drift = "none"|"shifted"|"lost"|"file" }
+--
+-- - "none":    record has no anchor (legacy) or buffer matches exactly.
+-- - "shifted": high-confidence match found at a different position. Use the
+--              returned line numbers for this read — caller does NOT rewrite
+--              the JSONL in Phase A.
+-- - "lost":    no acceptable match. Returned line numbers fall back to the
+--              record's stored values; UI should flag the note as drifted.
+-- - "file":    file-level note (no line numbers).
+--
+-- `buf_lines` is a 1-indexed array of strings. `current_blob` is the optional
+-- short SHA of the file's blob in the current HEAD; if both it and the
+-- anchor's stored blob match, we short-circuit with drift = "none".
+function M.resolve_anchor(record, buf_lines, current_blob)
+  if type(record) ~= 'table' then
+    return { line_start = nil, line_end = nil, drift = 'none' }
+  end
+  -- File-level note: no line numbers.
+  if record.scope == 'file' then
+    return { line_start = nil, line_end = nil, drift = 'file' }
+  end
+  local stored_start = record.line_start
+  local stored_end = record.line_end
+  if type(stored_start) ~= 'number' or type(stored_end) ~= 'number' then
+    return { line_start = stored_start, line_end = stored_end, drift = 'none' }
+  end
+  -- Legacy record (no anchor): trust stored line numbers.
+  local anchor = record.anchor
+  if type(anchor) ~= 'table' or type(anchor.lines) ~= 'table' or #anchor.lines == 0 then
+    return { line_start = stored_start, line_end = stored_end, drift = 'none' }
+  end
+  if type(buf_lines) ~= 'table' or #buf_lines == 0 then
+    return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
+  end
+
+  -- Blob fast path. If the stored blob matches the file's current blob, the
+  -- file is byte-identical to creation time — stored lines must be correct.
+  if anchor.blob and current_blob and anchor.blob ~= '' and anchor.blob == current_blob then
+    return { line_start = stored_start, line_end = stored_end, drift = 'none' }
+  end
+
+  local anchor_lines = normalize_list(anchor.lines)
+  local ctx_before = normalize_list(anchor.ctx_before or {})
+  local ctx_after = normalize_list(anchor.ctx_after or {})
+  local nlen = #anchor_lines
+
+  -- Exact-position check.
+  local cur_at_stored = {}
+  for i = stored_start, stored_end do
+    table.insert(cur_at_stored, M.normalize_anchor_line(buf_lines[i] or ''))
+  end
+  if exact_line_matches(anchor_lines, cur_at_stored) == nlen and #cur_at_stored == nlen then
+    return { line_start = stored_start, line_end = stored_end, drift = 'none' }
+  end
+
+  -- Windowed search for the best match nearby.
+  local window = math.max(50, 2 * nlen)
+  local lo = math.max(1, stored_start - window)
+  local hi = math.min(#buf_lines - nlen + 1, stored_start + window)
+  if hi < 1 then
+    return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
+  end
+
+  local best_score = -1
+  local best_start
+  local best_dist = math.huge
+  for c = lo, hi do
+    local body = slice(buf_lines, c, c + nlen - 1)
+    local body_norm = normalize_list(body)
+    local body_score = exact_line_matches(anchor_lines, body_norm)
+    local before = slice(buf_lines, c - #ctx_before, c - 1)
+    local before_norm = normalize_list(before)
+    local before_score = exact_line_matches(ctx_before, before_norm)
+    local after = slice(buf_lines, c + nlen, c + nlen + #ctx_after - 1)
+    local after_norm = normalize_list(after)
+    local after_score = exact_line_matches(ctx_after, after_norm)
+    local score = body_score + 0.5 * before_score + 0.5 * after_score
+    local dist = math.abs(c - stored_start)
+    if score > best_score or (score == best_score and dist < best_dist) then
+      best_score = score
+      best_start = c
+      best_dist = dist
+    end
+  end
+
+  if not best_start then
+    return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
+  end
+
+  -- Decide: full body match → shifted; >= 70% body match → shifted; else lost.
+  -- We compute body-only score for the threshold (context contributes to
+  -- tie-breaking but shouldn't carry a partial body match over the line).
+  local matched_body = slice(buf_lines, best_start, best_start + nlen - 1)
+  local body_only_score = exact_line_matches(anchor_lines, normalize_list(matched_body))
+  local threshold = math.max(1, math.ceil(0.7 * nlen))
+  if body_only_score >= threshold then
+    return {
+      line_start = best_start,
+      line_end = best_start + nlen - 1,
+      drift = 'shifted',
+    }
+  end
+  return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
 end
 
 -- Append a reply to records[idx]. Pure mutation — caller invokes

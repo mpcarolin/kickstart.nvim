@@ -131,6 +131,8 @@ return {
     vim.api.nvim_set_hl(0, 'ArbiterStatusInProgress', { link = 'DiagnosticInfo', default = true })
     vim.api.nvim_set_hl(0, 'ArbiterStatusNeedsRereview', { link = 'DiagnosticWarn', default = true })
     vim.api.nvim_set_hl(0, 'ArbiterStatusResolved', { link = 'Comment', default = true })
+    vim.api.nvim_set_hl(0, 'ArbiterStatusDrifted', { link = 'DiagnosticSignWarn', default = true })
+    vim.api.nvim_set_hl(0, 'ArbiterStatusFile', { link = 'DiagnosticSignInfo', default = true })
 
     -- Author highlight groups for reply headers in the preview window. Human
     -- replies use Comment (diminished) since the human is the local actor;
@@ -183,12 +185,24 @@ return {
     -- Row indices in heading_rows / reply_rows are 0-based and local to the
     -- returned `lines` array; callers concatenating multiple records must
     -- offset them before applying highlights.
-    local function render_record_lines(record)
+    --
+    -- `resolved` (optional) is the result of `core.resolve_anchor`. When
+    -- provided, the heading reflects drift state (lost notes get a warning
+    -- prefix; file-level notes show `[file-level]`).
+    local function render_record_lines(record, resolved)
       local lines = {}
       local heading_rows = {}
       local reply_rows = {}
       local status = core.normalize_status(record.status)
-      local range = string.format('L%d-%d', record.line_start, record.line_end)
+      local drift = resolved and resolved.drift or 'none'
+      local range
+      if drift == 'file' or record.scope == 'file' then
+        range = '[file-level]'
+      elseif drift == 'lost' then
+        range = string.format('⚠ drifted — original L%d-%d', record.line_start, record.line_end)
+      else
+        range = string.format('L%d-%d', record.line_start, record.line_end)
+      end
       table.insert(lines, string.format('# [%s] %s · %s', status, range, record.created_at or ''))
       table.insert(heading_rows, { row = #lines - 1, status = status })
       table.insert(lines, '')
@@ -238,6 +252,38 @@ return {
       vim.g.arbiter_signs_enabled = true
     end
 
+    -- Per-buffer cache of the resolved (line_start, line_end, drift) tuple
+    -- for each record matching this buffer's file. Keyed by bufnr → list of
+    -- { record_idx, resolved } so `find_records_at_cursor` can re-use the
+    -- result of the most recent diagnostic refresh instead of re-running the
+    -- windowed search on every cursor lookup.
+    local resolved_cache = {}
+
+    -- Read all lines from a buffer as a 1-indexed array of strings, suitable
+    -- for `core.resolve_anchor`. Returns an empty table if the buffer is gone.
+    local function read_buf_lines(bufnr)
+      if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+        return {}
+      end
+      return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    end
+
+    -- Resolve anchors for every record matching `rel` in `all_records`. Returns
+    -- a list of { idx (into all_records), record, resolved } and caches it
+    -- under `bufnr`.
+    local function resolve_records_for_buf(bufnr, all_records, rel)
+      local buf_lines = read_buf_lines(bufnr)
+      local out = {}
+      for i, r in ipairs(all_records) do
+        if r.file == rel then
+          local resolved = core.resolve_anchor(r, buf_lines)
+          table.insert(out, { idx = i, record = r, resolved = resolved })
+        end
+      end
+      resolved_cache[bufnr] = out
+      return out
+    end
+
     -- Refresh diagnostics for one buffer based on the JSONL + current branch.
     local function refresh_diagnostics_for_buf(bufnr)
       if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
@@ -264,25 +310,48 @@ return {
         return
       end
       local branch = core.current_branch(git_dir)
-      local records = core.filter_for_branch(core.read_jsonl(jsonl_path), branch)
+      local all = core.filter_for_branch(core.read_jsonl(jsonl_path), branch)
+      local resolved = resolve_records_for_buf(bufnr, all, rel)
       local diagnostics = {}
-      for _, r in ipairs(records) do
-        if r.file == rel and type(r.line_start) == 'number' and type(r.line_end) == 'number' then
-          local status = core.normalize_status(r.status)
-          local sev = STATUS_SEVERITY[status]
-          if sev then
-            local lnum = math.max(0, r.line_start - 1)
-            local end_lnum = math.max(lnum, r.line_end - 1)
-            local n_replies = #core.normalize_comments(r)
-            local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
+      for _, item in ipairs(resolved) do
+        local r = item.record
+        local res = item.resolved
+        local status = core.normalize_status(r.status)
+        local sev = STATUS_SEVERITY[status]
+        if sev then
+          local n_replies = #core.normalize_comments(r)
+          local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
+          if res.drift == 'file' then
             table.insert(diagnostics, {
-              lnum = lnum,
-              end_lnum = end_lnum,
+              lnum = 0,
+              end_lnum = 0,
               col = 0,
               severity = sev,
               source = 'arbiter',
-              message = '[' .. status .. '] ' .. tostring(r.note or '') .. suffix,
+              message = '[file] [' .. status .. '] ' .. tostring(r.note or '') .. suffix,
             })
+          elseif type(res.line_start) == 'number' and type(res.line_end) == 'number' then
+            local lnum = math.max(0, res.line_start - 1)
+            local end_lnum = math.max(lnum, res.line_end - 1)
+            if res.drift == 'lost' then
+              table.insert(diagnostics, {
+                lnum = lnum,
+                end_lnum = end_lnum,
+                col = 0,
+                severity = vim.diagnostic.severity.WARN,
+                source = 'arbiter',
+                message = '[drifted] [' .. status .. '] ' .. tostring(r.note or '') .. suffix,
+              })
+            else
+              table.insert(diagnostics, {
+                lnum = lnum,
+                end_lnum = end_lnum,
+                col = 0,
+                severity = sev,
+                source = 'arbiter',
+                message = '[' .. status .. '] ' .. tostring(r.note or '') .. suffix,
+              })
+            end
           end
         end
       end
@@ -451,7 +520,12 @@ return {
       vim.bo[right_buf].filetype = 'markdown'
       vim.bo[right_buf].swapfile = false
       local prefix = meta.title_prefix or 'reply'
-      local title = string.format('%s: %s:%d-%d', prefix, meta.file, meta.line_start, meta.line_end)
+      local title
+      if meta.scope == 'file' or type(meta.line_start) ~= 'number' then
+        title = string.format('%s: %s [file-level]', prefix, meta.file)
+      else
+        title = string.format('%s: %s:%d-%d', prefix, meta.file, meta.line_start, meta.line_end)
+      end
       vim.api.nvim_buf_set_name(right_buf, title)
 
       local right_win = vim.api.nvim_open_win(right_buf, true, {
@@ -530,7 +604,12 @@ return {
       vim.bo[buf].filetype = 'markdown'
       vim.bo[buf].swapfile = false
       local prefix = meta.title_prefix or 'review'
-      local title = string.format('%s: %s:%d-%d', prefix, meta.file, meta.line_start, meta.line_end)
+      local title
+      if meta.scope == 'file' then
+        title = string.format('%s: %s [file-level]', prefix, meta.file)
+      else
+        title = string.format('%s: %s:%d-%d', prefix, meta.file, meta.line_start, meta.line_end)
+      end
       vim.api.nvim_buf_set_name(buf, title)
 
       local width = math.min(80, math.floor(vim.o.columns * 0.7))
@@ -664,6 +743,16 @@ return {
       local jsonl_path = core.resolve_jsonl_path(git_dir)
       local branch = core.current_branch(git_dir)
 
+      -- Capture an anchor against the source buffer's current contents. For a
+      -- fugitive diff, source_bufnr is still the diff buffer — we can't read
+      -- the post-image of the file from it directly, so skip anchor capture in
+      -- that case (the note still works; it just behaves like a legacy note).
+      local anchor
+      if not is_fugitive_diff and vim.api.nvim_buf_is_valid(source_bufnr) then
+        local buf_lines = vim.api.nvim_buf_get_lines(source_bufnr, 0, -1, false)
+        anchor = core.build_anchor(buf_lines, line_start, line_end)
+      end
+
       open_note_window(meta, function(note)
         local record, err = core.create_note {
           jsonl_path = jsonl_path,
@@ -674,6 +763,7 @@ return {
           branch = branch,
           commit = meta.commit,
           author = 'human',
+          anchor = anchor,
         }
         if not record then
           vim.notify('arbiter: write failed: ' .. tostring(err), vim.log.levels.ERROR)
@@ -681,6 +771,55 @@ return {
         end
         vim.notify(
           string.format('arbiter: saved %s:%d-%d → %s', meta.file, meta.line_start, meta.line_end, vim.fn.fnamemodify(jsonl_path, ':~')),
+          vim.log.levels.INFO
+        )
+        if vim.api.nvim_buf_is_valid(source_bufnr) then
+          refresh_diagnostics_for_buf(source_bufnr)
+        end
+      end)
+    end
+
+    -- File-level note entry point. Anchored to the file as a whole (no line
+    -- range). Renders at line 1 with a sign + virtual_text marker.
+    function M.add_file_comment()
+      local bufnr = vim.api.nvim_get_current_buf()
+      local source_bufnr = bufnr
+      local bufname = vim.api.nvim_buf_get_name(bufnr)
+      if bufname == '' then
+        vim.notify('arbiter: buffer has no filename', vim.log.levels.ERROR)
+        return
+      end
+      if vim.bo[bufnr].filetype == 'git' then
+        vim.notify('arbiter: file-level notes are not supported on fugitive diff buffers', vim.log.levels.ERROR)
+        return
+      end
+      local repo_root, git_dir = find_git_root_for(bufname)
+      if not repo_root or not git_dir then
+        vim.notify('arbiter: not inside a git repo', vim.log.levels.ERROR)
+        return
+      end
+      local abs = vim.fn.fnamemodify(bufname, ':p')
+      local file_path = repo_relpath(repo_root, abs) or abs
+      local jsonl_path = core.resolve_jsonl_path(git_dir)
+      local branch = core.current_branch(git_dir)
+
+      local meta = { file = file_path, scope = 'file' }
+      open_note_window(meta, function(note)
+        local record, err = core.create_note {
+          jsonl_path = jsonl_path,
+          file = file_path,
+          line_start = nil,
+          line_end = nil,
+          note = note,
+          branch = branch,
+          author = 'human',
+        }
+        if not record then
+          vim.notify('arbiter: write failed: ' .. tostring(err), vim.log.levels.ERROR)
+          return
+        end
+        vim.notify(
+          string.format('arbiter: saved %s [file-level] → %s', file_path, vim.fn.fnamemodify(jsonl_path, ':~')),
           vim.log.levels.INFO
         )
         if vim.api.nvim_buf_is_valid(source_bufnr) then
@@ -706,19 +845,23 @@ return {
         core.sort_resolved_last(records)
         local out = {}
         for _, r in ipairs(records) do
-          if r.file and type(r.line_start) == 'number' then
-            local note = tostring(r.note or '')
-            local first_nl = note:find '\n'
-            local preview = first_nl and (note:sub(1, first_nl - 1) .. ' …') or note
-            table.insert(out, {
-              fname = repo_root_clean .. '/' .. r.file,
-              file_rel = r.file,
-              lnum = r.line_start,
-              status = core.normalize_status(r.status),
-              preview = preview,
-              created_at = r.created_at,
-              n_replies = #core.normalize_comments(r),
-            })
+          if r.file then
+            local is_file_level = r.scope == 'file' or type(r.line_start) ~= 'number'
+            if is_file_level or type(r.line_start) == 'number' then
+              local note = tostring(r.note or '')
+              local first_nl = note:find '\n'
+              local preview = first_nl and (note:sub(1, first_nl - 1) .. ' …') or note
+              table.insert(out, {
+                fname = repo_root_clean .. '/' .. r.file,
+                file_rel = r.file,
+                lnum = is_file_level and 1 or r.line_start,
+                file_level = is_file_level,
+                status = core.normalize_status(r.status),
+                preview = preview,
+                created_at = r.created_at,
+                n_replies = #core.normalize_comments(r),
+              })
+            end
           end
         end
         return out
@@ -737,7 +880,8 @@ return {
         local n = e.n_replies or 0
         local prefix = string.format('[%s] ', e.status)
         local chip = n > 0 and string.format('[%d↩] ', n) or ''
-        local line = string.format('%s%s%s:%d  %s', prefix, chip, e.file_rel, e.lnum, e.preview)
+        local locator = e.file_level and string.format('%s [file]', e.file_rel) or string.format('%s:%d', e.file_rel, e.lnum)
+        local line = string.format('%s%s%s  %s', prefix, chip, locator, e.preview)
         if n == 0 then
           return line, nil
         end
@@ -844,12 +988,13 @@ return {
 
       local function find_record_index(all, e)
         for i, r in ipairs(all) do
-          if
-            r.file == e.file_rel
-            and r.line_start == e.lnum
-            and tostring(r.created_at or '') == tostring(e.created_at or '')
-          then
-            return i
+          if r.file == e.file_rel and tostring(r.created_at or '') == tostring(e.created_at or '') then
+            local r_is_file = r.scope == 'file' or type(r.line_start) ~= 'number'
+            if e.file_level and r_is_file then
+              return i
+            elseif not e.file_level and not r_is_file and r.line_start == e.lnum then
+              return i
+            end
           end
         end
         return nil
@@ -990,7 +1135,11 @@ return {
       end)
     end
 
-    -- Find every record on the current line. Returns (all, matches, jsonl_path, err)
+    -- Find every record matching the current cursor position. Range notes
+    -- match when the cursor is within their resolved range; file-level notes
+    -- match for every cursor position in the file. Returns
+    --   (all, matches, jsonl_path, err)
+    -- where each match is { idx, record, resolved }.
     local function find_records_at_cursor()
       local bufnr = vim.api.nvim_get_current_buf()
       local bufname = vim.api.nvim_buf_get_name(bufnr)
@@ -1010,18 +1159,27 @@ return {
       local branch = core.current_branch(git_dir)
       local cursor_lnum = vim.fn.line '.'
       local all = core.read_jsonl(jsonl_path)
+
+      -- Resolve anchors against current buffer contents. We can't trust the
+      -- cache here because `all` is the full unfiltered JSONL, while the
+      -- cache holds branch-filtered rows. Re-resolve directly so indices into
+      -- `all` line up for the caller's downstream `rewrite_jsonl`.
+      local buf_lines = read_buf_lines(bufnr)
       local matches = {}
       for i, r in ipairs(all) do
         local matches_branch = r.branch == nil or r.branch == core.NULL or r.branch == branch
-        if
-          matches_branch
-          and r.file == rel
-          and type(r.line_start) == 'number'
-          and type(r.line_end) == 'number'
-          and cursor_lnum >= r.line_start
-          and cursor_lnum <= r.line_end
-        then
-          table.insert(matches, { idx = i, record = r })
+        if matches_branch and r.file == rel then
+          local resolved = core.resolve_anchor(r, buf_lines)
+          local hit = false
+          if resolved.drift == 'file' then
+            hit = true
+          elseif type(resolved.line_start) == 'number' and type(resolved.line_end) == 'number'
+            and cursor_lnum >= resolved.line_start and cursor_lnum <= resolved.line_end then
+            hit = true
+          end
+          if hit then
+            table.insert(matches, { idx = i, record = r, resolved = resolved })
+          end
         end
       end
       core.sort_resolved_last(matches, function(m)
@@ -1284,7 +1442,7 @@ return {
           table.insert(lines, '')
         end
         local offset = #lines
-        local rendered = render_record_lines(m.record)
+        local rendered = render_record_lines(m.record, m.resolved)
         for _, l in ipairs(rendered.lines) do
           table.insert(lines, l)
         end
@@ -1420,6 +1578,7 @@ return {
           file = r.file,
           line_start = r.line_start,
           line_end = r.line_end,
+          scope = r.scope,
           title_prefix = 'reply',
         }
         local source_win = vim.fn.bufwinid(source_buf)
@@ -1429,6 +1588,11 @@ return {
           if err2 then
             vim.notify('arbiter: reply failed: ' .. tostring(err2), vim.log.levels.ERROR)
             return
+          end
+          -- A human reply on a needs-rereview note flips it back to pending so
+          -- the AI knows to look again on the next pass.
+          if all[idx].status == 'needs-rereview' then
+            all[idx].status = 'pending'
           end
           local ok_w, werr = core.rewrite_jsonl(jsonl_path, all)
           if not ok_w then
@@ -1473,6 +1637,7 @@ return {
           file = r.file,
           line_start = r.line_start,
           line_end = r.line_end,
+          scope = r.scope,
           title_prefix = 'reply',
         }
         open_reply_window_with_context(r, meta, function(body)
@@ -1480,6 +1645,9 @@ return {
           if not reply then
             vim.notify('arbiter: reply failed: ' .. tostring(err), vim.log.levels.ERROR)
             return
+          end
+          if all[idx].status == 'needs-rereview' then
+            all[idx].status = 'pending'
           end
           local ok_w, werr = core.rewrite_jsonl(jsonl_path, all)
           if not ok_w then
@@ -1503,6 +1671,14 @@ return {
     vim.api.nvim_create_user_command('ArbiterReply', function()
       M.add_reply()
     end, { desc = 'arbiter: reply to a note on the current line' })
+
+    vim.api.nvim_create_user_command('ArbiterFileComment', function()
+      M.add_file_comment()
+    end, { desc = 'arbiter: leave a file-level review note (no line range)' })
+
+    vim.keymap.set('n', '<leader>gF', function()
+      M.add_file_comment()
+    end, { desc = 'arbiter: [F]ile-level review comment' })
 
     vim.keymap.set('n', '<leader>gr', function()
       local l = vim.fn.line '.'
@@ -1615,12 +1791,12 @@ return {
       local entries = {}
       for _, r in ipairs(records) do
         local status = core.normalize_status(r.status)
-        if
-          STATUS_SEVERITY[status]
-          and r.file
-          and type(r.line_start) == 'number'
-        then
-          table.insert(entries, { file = r.file, lnum = r.line_start })
+        if STATUS_SEVERITY[status] and r.file then
+          if r.scope == 'file' then
+            table.insert(entries, { file = r.file, lnum = 1 })
+          elseif type(r.line_start) == 'number' then
+            table.insert(entries, { file = r.file, lnum = r.line_start })
+          end
         end
       end
       if #entries == 0 then
