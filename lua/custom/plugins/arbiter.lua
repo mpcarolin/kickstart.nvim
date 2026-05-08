@@ -27,6 +27,8 @@
 --   <leader>gd  resolve note(s) on the current line. With one note, resolves
 --               immediately. With multiple, opens a checklist popup.
 --   <leader>gp  preview full text of all notes on the current line
+--   ]g / [g     jump to next/previous arbiter note across all files in the
+--               current branch (resolved notes are skipped; wraps around)
 --
 -- Record schema (see core.lua / SKILL.md for the canonical contract):
 --   file, line_start, line_end, commit, branch, note, created_at, status
@@ -92,6 +94,20 @@ return {
       return repo_root, git_dir
     end
 
+    -- Convert an absolute file path to a path relative to repo_root, or nil
+    -- if the file lies outside the repo. Returns the trailing-slash-stripped
+    -- root_abs as a second value so callers that need it can skip recomputing.
+    local function repo_relpath(repo_root, abs_path)
+      if not repo_root or not abs_path then
+        return nil, nil
+      end
+      local root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
+      if abs_path:sub(1, #root_abs + 1) ~= root_abs .. '/' then
+        return nil, root_abs
+      end
+      return abs_path:sub(#root_abs + 2), root_abs
+    end
+
     local STATUSES = core.STATUSES
 
     -- Resolved notes are intentionally omitted — they're done, no need to
@@ -121,6 +137,8 @@ return {
     -- AI replies use Function so they stand out in the thread.
     vim.api.nvim_set_hl(0, 'ArbiterAuthorHuman', { link = 'Comment', default = true })
     vim.api.nvim_set_hl(0, 'ArbiterAuthorAI', { link = 'Function', default = true })
+
+    vim.api.nvim_set_hl(0, 'ArbiterReplyCount', { link = 'Special', default = true })
 
     local hl_ns = vim.api.nvim_create_namespace 'arbiter_hl'
 
@@ -158,6 +176,63 @@ return {
       end
     end
 
+    local function lang_for(file)
+      return file and vim.filetype.match { filename = file } or nil
+    end
+
+    -- Row indices in heading_rows / reply_rows are 0-based and local to the
+    -- returned `lines` array; callers concatenating multiple records must
+    -- offset them before applying highlights.
+    local function render_record_lines(record)
+      local lines = {}
+      local heading_rows = {}
+      local reply_rows = {}
+      local status = core.normalize_status(record.status)
+      local range = string.format('L%d-%d', record.line_start, record.line_end)
+      table.insert(lines, string.format('# [%s] %s · %s', status, range, record.created_at or ''))
+      table.insert(heading_rows, { row = #lines - 1, status = status })
+      table.insert(lines, '')
+      for note_line in (tostring(record.note or '')):gmatch '[^\n]+' do
+        table.insert(lines, note_line)
+      end
+      local lang = lang_for(record.file)
+      for _, reply in ipairs(core.normalize_comments(record)) do
+        table.insert(lines, '')
+        table.insert(lines, '')
+        local author = core.normalize_author(reply)
+        local header = string.format('  ↳ %s · %s', author, tostring(reply.created_at or ''))
+        table.insert(lines, header)
+        local header_row = #lines - 1
+        local rule_width = vim.fn.strdisplaywidth(header) - 2
+        if rule_width < 1 then
+          rule_width = 1
+        end
+        table.insert(lines, '  ' .. string.rep('─', rule_width))
+        local rule_row = #lines - 1
+        table.insert(lines, '')
+        table.insert(reply_rows, { author = author, rows = { header_row, rule_row } })
+        local in_fence = false
+        for body_line in (tostring(reply.body or '')):gmatch '[^\n]+' do
+          local fence_open = body_line:match '^```(.*)$'
+          if fence_open and not in_fence then
+            in_fence = true
+            local tag = fence_open:gsub('^%s+', ''):gsub('%s+$', '')
+            if tag == '' and lang then
+              table.insert(lines, '  ```' .. lang)
+            else
+              table.insert(lines, '  ' .. body_line)
+            end
+          elseif body_line:match '^```%s*$' and in_fence then
+            in_fence = false
+            table.insert(lines, '  ' .. body_line)
+          else
+            table.insert(lines, '  ' .. body_line)
+          end
+        end
+      end
+      return { lines = lines, heading_rows = heading_rows, reply_rows = reply_rows }
+    end
+
     local diag_ns = vim.api.nvim_create_namespace 'arbiter'
     if vim.g.arbiter_signs_enabled == nil then
       vim.g.arbiter_signs_enabled = true
@@ -184,11 +259,10 @@ return {
       end
       local jsonl_path = core.resolve_jsonl_path(git_dir)
       local abs = vim.fn.fnamemodify(bufname, ':p')
-      local root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
-      if abs:sub(1, #root_abs + 1) ~= root_abs .. '/' then
+      local rel = repo_relpath(repo_root, abs)
+      if not rel then
         return
       end
-      local rel = abs:sub(#root_abs + 2)
       local branch = core.current_branch(git_dir)
       local records = core.filter_for_branch(core.read_jsonl(jsonl_path), branch)
       local diagnostics = {}
@@ -332,6 +406,123 @@ return {
       }
     end
 
+    local function open_reply_window_with_context(record, meta, on_save, on_cancel)
+      local total_width = math.min(160, math.floor(vim.o.columns * 0.9))
+      local pane_width = math.floor((total_width - 2) / 2)
+      local height = math.min(24, math.floor(vim.o.lines * 0.7))
+      local row = math.floor((vim.o.lines - height) / 2)
+      local col_left = math.floor((vim.o.columns - total_width) / 2)
+      local col_right = col_left + pane_width + 2
+
+      local left_buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[left_buf].buftype = 'nofile'
+      vim.bo[left_buf].bufhidden = 'wipe'
+      vim.bo[left_buf].swapfile = false
+      vim.bo[left_buf].filetype = 'markdown'
+
+      local rendered = render_record_lines(record)
+      vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, rendered.lines)
+      for _, h in ipairs(rendered.heading_rows) do
+        highlight_status_line(left_buf, h.row, h.status)
+      end
+      for _, rep in ipairs(rendered.reply_rows) do
+        highlight_reply_lines(left_buf, rep.rows, rep.author)
+      end
+      vim.bo[left_buf].modifiable = false
+
+      local left_win = vim.api.nvim_open_win(left_buf, false, {
+        relative = 'editor',
+        row = row,
+        col = col_left,
+        width = pane_width,
+        height = height,
+        style = 'minimal',
+        border = 'rounded',
+        title = ' arbiter notes (read-only · <C-w>w to focus) ',
+        title_pos = 'center',
+      })
+      vim.wo[left_win].wrap = true
+      vim.wo[left_win].linebreak = true
+      vim.wo[left_win].cursorline = true
+
+      local right_buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[right_buf].buftype = 'acwrite'
+      vim.bo[right_buf].bufhidden = 'wipe'
+      vim.bo[right_buf].filetype = 'markdown'
+      vim.bo[right_buf].swapfile = false
+      local prefix = meta.title_prefix or 'reply'
+      local title = string.format('%s: %s:%d-%d', prefix, meta.file, meta.line_start, meta.line_end)
+      vim.api.nvim_buf_set_name(right_buf, title)
+
+      local right_win = vim.api.nvim_open_win(right_buf, true, {
+        relative = 'editor',
+        row = row,
+        col = col_right,
+        width = pane_width,
+        height = height,
+        style = 'minimal',
+        border = 'rounded',
+        title = ' ' .. title .. ' (:w save · <Esc><Esc> cancel) ',
+        title_pos = 'center',
+      })
+      vim.wo[right_win].wrap = true
+      vim.wo[right_win].linebreak = true
+
+      local closed = false
+      local function close_both()
+        if closed then
+          return
+        end
+        closed = true
+        if left_win and vim.api.nvim_win_is_valid(left_win) then
+          vim.api.nvim_win_close(left_win, true)
+        end
+        if right_win and vim.api.nvim_win_is_valid(right_win) then
+          vim.api.nvim_win_close(right_win, true)
+        end
+      end
+
+      vim.api.nvim_create_autocmd('BufWriteCmd', {
+        buffer = right_buf,
+        callback = function()
+          local body_lines = vim.api.nvim_buf_get_lines(right_buf, 0, -1, false)
+          local note = table.concat(body_lines, '\n'):gsub('^%s+', ''):gsub('%s+$', '')
+          vim.bo[right_buf].modified = false
+          if note == '' then
+            vim.notify('arbiter: empty note, not saved', vim.log.levels.WARN)
+            close_both()
+            return
+          end
+          on_save(note)
+          close_both()
+        end,
+      })
+
+      local function cancel()
+        if on_cancel then
+          on_cancel()
+        end
+        close_both()
+      end
+
+      vim.keymap.set('n', '<Esc><Esc>', cancel, { buffer = right_buf, silent = true, desc = 'cancel reply' })
+      vim.keymap.set('n', 'q', cancel, { buffer = left_buf, silent = true, nowait = true, desc = 'cancel reply' })
+      vim.keymap.set('n', '<Esc>', cancel, { buffer = left_buf, silent = true, nowait = true, desc = 'cancel reply' })
+
+      vim.api.nvim_create_autocmd('WinClosed', {
+        pattern = tostring(left_win),
+        once = true,
+        callback = close_both,
+      })
+      vim.api.nvim_create_autocmd('WinClosed', {
+        pattern = tostring(right_win),
+        once = true,
+        callback = close_both,
+      })
+
+      vim.cmd 'startinsert'
+    end
+
     local function open_note_window(meta, on_save, on_cancel)
       local buf = vim.api.nvim_create_buf(false, true)
       vim.bo[buf].buftype = 'acwrite'
@@ -448,11 +639,8 @@ return {
           vim.notify('arbiter: not inside a git repo', vim.log.levels.ERROR)
           return
         end
-        file_path = vim.fn.fnamemodify(bufname, ':p')
-        local root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
-        if file_path:sub(1, #root_abs + 1) == root_abs .. '/' then
-          file_path = file_path:sub(#root_abs + 2)
-        end
+        local abs = vim.fn.fnamemodify(bufname, ':p')
+        file_path = repo_relpath(repo_root, abs) or abs
         line_start = start_line
         line_end = end_line
       end
@@ -542,6 +730,20 @@ return {
         return
       end
 
+      -- Format an entry's display line and the byte range of its chip (or
+      -- nil if no chip). Single source of truth for both the line text and
+      -- highlight column math, so they can't drift.
+      local function format_entry(e)
+        local n = e.n_replies or 0
+        local prefix = string.format('[%s] ', e.status)
+        local chip = n > 0 and string.format('[%d↩] ', n) or ''
+        local line = string.format('%s%s%s:%d  %s', prefix, chip, e.file_rel, e.lnum, e.preview)
+        if n == 0 then
+          return line, nil
+        end
+        return line, { start_col = #prefix, end_col = #prefix + #chip }
+      end
+
       local function format_lines(es)
         local lines = {
           string.format('# arbiter notes (%s) — %d entries', branch or '<unknown>', #es),
@@ -552,11 +754,29 @@ return {
           table.insert(lines, '(no notes)')
         else
           for _, e in ipairs(es) do
-            local suffix = (e.n_replies and e.n_replies > 0) and string.format(' (%d replies)', e.n_replies) or ''
-            table.insert(lines, string.format('[%s] %s:%d  %s%s', e.status, e.file_rel, e.lnum, e.preview, suffix))
+            local line = format_entry(e)
+            table.insert(lines, line)
           end
         end
         return lines
+      end
+
+      -- Higher priority than highlight_status_line so the chip color
+      -- punches through the hl_eol-filled status background.
+      local function apply_entry_highlights(target_buf, es)
+        for i, e in ipairs(es) do
+          local row = header_rows + i - 1
+          highlight_status_line(target_buf, row, e.status)
+          local _, chip = format_entry(e)
+          if chip then
+            vim.api.nvim_buf_set_extmark(target_buf, hl_ns, row, chip.start_col, {
+              end_row = row,
+              end_col = chip.end_col,
+              hl_group = 'ArbiterReplyCount',
+              priority = 200,
+            })
+          end
+        end
       end
 
       local lines = format_lines(entries)
@@ -574,9 +794,7 @@ return {
       vim.bo[buf].bufhidden = 'wipe'
       vim.bo[buf].filetype = 'arbiter-list'
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-      for i, e in ipairs(entries) do
-        highlight_status_line(buf, header_rows + i - 1, e.status)
-      end
+      apply_entry_highlights(buf, entries)
       vim.bo[buf].modifiable = false
 
       local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 2)
@@ -607,9 +825,7 @@ return {
         vim.api.nvim_buf_set_lines(buf, 0, -1, false, new_lines)
         vim.bo[buf].modifiable = false
         vim.api.nvim_buf_clear_namespace(buf, hl_ns, 0, -1)
-        for i, e in ipairs(entries) do
-          highlight_status_line(buf, header_rows + i - 1, e.status)
-        end
+        apply_entry_highlights(buf, entries)
         local last_entry_row = header_rows + math.max(#entries, 1)
         local total = vim.api.nvim_buf_line_count(buf)
         local clamped = math.min(prev_row, last_entry_row, total)
@@ -787,11 +1003,10 @@ return {
       end
       local jsonl_path = core.resolve_jsonl_path(git_dir)
       local abs = vim.fn.fnamemodify(bufname, ':p')
-      local root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
-      if abs:sub(1, #root_abs + 1) ~= root_abs .. '/' then
+      local rel = repo_relpath(repo_root, abs)
+      if not rel then
         return nil, nil, nil, 'file is outside repo'
       end
-      local rel = abs:sub(#root_abs + 2)
       local branch = core.current_branch(git_dir)
       local cursor_lnum = vim.fn.line '.'
       local all = core.read_jsonl(jsonl_path)
@@ -1059,61 +1274,29 @@ return {
         vim.notify('arbiter: no notes on this line', vim.log.levels.WARN)
         return
       end
-      local function lang_for(file)
-        return file and vim.filetype.match { filename = file } or nil
-      end
       local lines = {}
       local heading_rows = {}
       local reply_rows = {}
       for i, m in ipairs(matches) do
-        local r = m.record
         if i > 1 then
           table.insert(lines, '')
           table.insert(lines, '---')
           table.insert(lines, '')
         end
-        local status = core.normalize_status(r.status)
-        local range = string.format('L%d-%d', r.line_start, r.line_end)
-        table.insert(lines, string.format('# [%s] %s · %s', status, range, r.created_at or ''))
-        table.insert(heading_rows, { row = #lines - 1, status = status, match_idx = i })
-        table.insert(lines, '')
-        for note_line in (tostring(r.note or '')):gmatch '[^\n]+' do
-          table.insert(lines, note_line)
+        local offset = #lines
+        local rendered = render_record_lines(m.record)
+        for _, l in ipairs(rendered.lines) do
+          table.insert(lines, l)
         end
-        local lang = lang_for(r.file)
-        for _, reply in ipairs(core.normalize_comments(r)) do
-          table.insert(lines, '')
-          table.insert(lines, '')
-          local author = core.normalize_author(reply)
-          local header = string.format('  ↳ %s · %s', author, tostring(reply.created_at or ''))
-          table.insert(lines, header)
-          local header_row = #lines - 1
-          local rule_width = vim.fn.strdisplaywidth(header) - 2
-          if rule_width < 1 then
-            rule_width = 1
+        for _, h in ipairs(rendered.heading_rows) do
+          table.insert(heading_rows, { row = h.row + offset, status = h.status, match_idx = i })
+        end
+        for _, rep in ipairs(rendered.reply_rows) do
+          local rows = {}
+          for _, rr in ipairs(rep.rows) do
+            table.insert(rows, rr + offset)
           end
-          table.insert(lines, '  ' .. string.rep('─', rule_width))
-          local rule_row = #lines - 1
-          table.insert(lines, '')
-          table.insert(reply_rows, { author = author, rows = { header_row, rule_row } })
-          local in_fence = false
-          for body_line in (tostring(reply.body or '')):gmatch '[^\n]+' do
-            local fence_open = body_line:match '^```(.*)$'
-            if fence_open and not in_fence then
-              in_fence = true
-              local tag = fence_open:gsub('^%s+', ''):gsub('%s+$', '')
-              if tag == '' and lang then
-                table.insert(lines, '  ```' .. lang)
-              else
-                table.insert(lines, '  ' .. body_line)
-              end
-            elseif body_line:match '^```%s*$' and in_fence then
-              in_fence = false
-              table.insert(lines, '  ' .. body_line)
-            else
-              table.insert(lines, '  ' .. body_line)
-            end
-          end
+          table.insert(reply_rows, { author = rep.author, rows = rows })
         end
       end
 
@@ -1241,7 +1424,7 @@ return {
         }
         local source_win = vim.fn.bufwinid(source_buf)
         close()
-        open_note_window(meta, function(body)
+        open_reply_window_with_context(r, meta, function(body)
           local _, err2 = core.append_reply(all, idx, { body = body, author = 'human' })
           if err2 then
             vim.notify('arbiter: reply failed: ' .. tostring(err2), vim.log.levels.ERROR)
@@ -1292,7 +1475,7 @@ return {
           line_end = r.line_end,
           title_prefix = 'reply',
         }
-        open_note_window(meta, function(body)
+        open_reply_window_with_context(r, meta, function(body)
           local reply, err = core.append_reply(all, idx, { body = body, author = 'human' })
           if not reply then
             vim.notify('arbiter: reply failed: ' .. tostring(err), vim.log.levels.ERROR)
@@ -1418,6 +1601,99 @@ return {
     vim.keymap.set('n', '<leader>gR', function()
       M.add_reply()
     end, { desc = 'arbiter: [R]eply to note on current line' })
+
+    function M.goto_note(direction)
+      local jsonl_path, repo_root, git_dir, err = resolve_paths()
+      if err then
+        vim.notify('arbiter: ' .. err, vim.log.levels.WARN)
+        return
+      end
+      local branch = core.current_branch(git_dir)
+      local records = core.filter_for_branch(core.read_jsonl(jsonl_path), branch)
+      -- STATUS_SEVERITY only maps unresolved statuses, so this filter
+      -- skips resolved notes implicitly (same trick as the diagnostics).
+      local entries = {}
+      for _, r in ipairs(records) do
+        local status = core.normalize_status(r.status)
+        if
+          STATUS_SEVERITY[status]
+          and r.file
+          and type(r.line_start) == 'number'
+        then
+          table.insert(entries, { file = r.file, lnum = r.line_start })
+        end
+      end
+      if #entries == 0 then
+        vim.notify('arbiter: no notes for ' .. (branch or '<unknown>'), vim.log.levels.INFO)
+        return
+      end
+      table.sort(entries, function(a, b)
+        if a.file == b.file then
+          return a.lnum < b.lnum
+        end
+        return a.file < b.file
+      end)
+
+      local cur_bufname = vim.api.nvim_buf_get_name(0)
+      local cur_rel, root_abs
+      if cur_bufname ~= '' then
+        local abs = vim.fn.fnamemodify(cur_bufname, ':p')
+        cur_rel, root_abs = repo_relpath(repo_root, abs)
+      end
+      if not root_abs then
+        root_abs = vim.fn.fnamemodify(repo_root, ':p'):gsub('/$', '')
+      end
+      local cur_lnum = vim.fn.line '.'
+
+      local function cmp(a_file, a_lnum, b_file, b_lnum)
+        if a_file == b_file then
+          if a_lnum == b_lnum then
+            return 0
+          end
+          return a_lnum < b_lnum and -1 or 1
+        end
+        return a_file < b_file and -1 or 1
+      end
+
+      local target
+      if direction == 'next' then
+        for _, e in ipairs(entries) do
+          if not cur_rel or cmp(e.file, e.lnum, cur_rel, cur_lnum) > 0 then
+            target = e
+            break
+          end
+        end
+        if not target then
+          target = entries[1]
+        end
+      else
+        for i = #entries, 1, -1 do
+          local e = entries[i]
+          if not cur_rel or cmp(e.file, e.lnum, cur_rel, cur_lnum) < 0 then
+            target = e
+            break
+          end
+        end
+        if not target then
+          target = entries[#entries]
+        end
+      end
+
+      local target_abs = root_abs .. '/' .. target.file
+      if target.file ~= cur_rel then
+        vim.cmd('edit ' .. vim.fn.fnameescape(target_abs))
+      end
+      pcall(vim.api.nvim_win_set_cursor, 0, { target.lnum, 0 })
+      vim.cmd 'normal! zz'
+    end
+
+    vim.keymap.set('n', ']g', function()
+      M.goto_note 'next'
+    end, { desc = 'arbiter: jump to next note (across files)' })
+
+    vim.keymap.set('n', '[g', function()
+      M.goto_note 'prev'
+    end, { desc = 'arbiter: jump to previous note (across files)' })
 
     local diag_group = vim.api.nvim_create_augroup('ArbiterDiagnostics', { clear = true })
     vim.api.nvim_create_autocmd({ 'BufReadPost', 'BufEnter' }, {
