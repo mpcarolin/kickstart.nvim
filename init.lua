@@ -434,7 +434,7 @@ require('lazy').setup({
         --
         defaults = {
           file_ignore_patterns = {
-            '%-agent%d+/',
+            -- '%-agent%d+/',
           },
           mappings = {
             i = {

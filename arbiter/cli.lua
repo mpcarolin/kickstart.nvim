@@ -247,7 +247,7 @@ local function cmd_list(opts)
     local n_replies = #core.normalize_comments(r)
     local suffix = n_replies > 0 and string.format(' (%d replies)', n_replies) or ''
     local locator
-    if r.scope == 'file' or type(r.line_start) ~= 'number' then
+    if core.is_file_level(r) then
       locator = file .. ' [file]'
     else
       local ls = tonumber(r.line_start) or 0
@@ -266,7 +266,7 @@ local function format_show(record, want_json)
   local id = core.record_id(record)
   local status = core.normalize_status(record.status)
   local lines_str
-  if record.scope == 'file' or type(record.line_start) ~= 'number' then
+  if core.is_file_level(record) then
     lines_str = '(file-level)'
   else
     lines_str = string.format('%d-%d', tonumber(record.line_start) or 0, tonumber(record.line_end) or 0)
@@ -353,33 +353,6 @@ local function cmd_resolve(opts)
   -- Re-dispatch through set-status so all the same checks run.
   opts[3] = 'resolved'
   return cmd_set_status(opts)
-end
-
--- Count lines in a file. Each '\n' is one line; if the file ends without a
--- trailing newline, the final partial line still counts. Empty file → 0.
-local function count_lines(path)
-  local f = io.open(path, 'r')
-  if not f then
-    return nil
-  end
-  local n = 0
-  local trailing_newline = false
-  while true do
-    local chunk = f:read(8192)
-    if not chunk then
-      break
-    end
-    if #chunk > 0 then
-      local _, c = chunk:gsub('\n', '\n')
-      n = n + c
-      trailing_newline = chunk:sub(-1) == '\n'
-    end
-  end
-  f:close()
-  if n > 0 and not trailing_newline then
-    n = n + 1
-  end
-  return n
 end
 
 local function cmd_add(opts)
@@ -482,18 +455,25 @@ local function cmd_add(opts)
     die 'file is outside the repo'
   end
 
-  -- Line bounds (range notes only).
+  -- Read the file once: bounds-check the requested range and capture an
+  -- anchor in a single pass.
+  local anchor
   if line_end ~= nil then
-    local total = count_lines(resolved)
-    if total == nil then
+    local f = io.open(resolved, 'r')
+    if not f then
       die('no such file: ' .. file_arg)
     end
-    if line_end > total then
-      die(string.format('line %d is past end of file (%d lines)', line_end, total))
+    local file_lines = {}
+    for ln in f:lines() do
+      table.insert(file_lines, ln)
     end
+    f:close()
+    if line_end > #file_lines then
+      die(string.format('line %d is past end of file (%d lines)', line_end, #file_lines))
+    end
+    anchor = core.build_anchor(file_lines, line_start, line_end)
   end
 
-  -- Resolve commit.
   local commit
   if opts.commit_null then
     commit = nil
@@ -503,26 +483,11 @@ local function cmd_add(opts)
     commit = core.head_short_sha(git_dir)
   end
 
-  -- Resolve branch (best-effort; nil/null on failure or detached HEAD edge cases).
   local branch = core.current_branch(git_dir)
 
   local jsonl = core.resolve_jsonl_path(git_dir)
   if not jsonl then
     die('cannot resolve jsonl path', 3)
-  end
-
-  -- Capture an anchor for range notes by reading the file from disk.
-  local anchor
-  if line_start ~= nil then
-    local f = io.open(resolved, 'r')
-    if f then
-      local file_lines = {}
-      for ln in f:lines() do
-        table.insert(file_lines, ln)
-      end
-      f:close()
-      anchor = core.build_anchor(file_lines, line_start, line_end)
-    end
   end
 
   local record, err = core.create_note {

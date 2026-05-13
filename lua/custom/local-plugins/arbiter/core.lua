@@ -125,6 +125,19 @@ function M.is_status(s)
   return STATUS_SET[s] == true
 end
 
+-- A record is file-level if its scope is "file" or its line numbers are
+-- absent / non-numeric (legacy records that pre-date scope round-trip with
+-- numeric line numbers, so the scope check is the dominant signal).
+function M.is_file_level(record)
+  if type(record) ~= 'table' then
+    return false
+  end
+  if record.scope == 'file' then
+    return true
+  end
+  return type(record.line_start) ~= 'number'
+end
+
 function M.normalize_status(s)
   if s == nil or s == M.NULL or s == '' then
     return 'pending'
@@ -444,6 +457,19 @@ function M.normalize_anchor_line(s)
   return s
 end
 
+-- Normalize a list of buffer lines once, suitable for passing to multiple
+-- `resolve_anchor` calls against the same buffer.
+function M.normalize_buf_lines(buf_lines)
+  if type(buf_lines) ~= 'table' then
+    return {}
+  end
+  local out = {}
+  for i = 1, #buf_lines do
+    out[i] = M.normalize_anchor_line(buf_lines[i])
+  end
+  return out
+end
+
 local function normalize_list(list)
   local out = {}
   if type(list) ~= 'table' then
@@ -478,38 +504,6 @@ function M.build_anchor(buf_lines, line_start, line_end, blob)
   return anchor
 end
 
--- Compare two normalized line lists. Returns the count of positions where
--- they match exactly. Operates on already-normalized strings.
-local function exact_line_matches(a, b)
-  if type(a) ~= 'table' or type(b) ~= 'table' then
-    return 0
-  end
-  local n = math.min(#a, #b)
-  local matches = 0
-  for i = 1, n do
-    if a[i] == b[i] then
-      matches = matches + 1
-    end
-  end
-  return matches
-end
-
--- Slice a list into a new array [from..to] (inclusive). Out-of-bounds indices
--- are clamped to the list bounds; the returned slice is empty if the range
--- is entirely outside the list.
-local function slice(list, from, to)
-  local out = {}
-  if type(list) ~= 'table' then
-    return out
-  end
-  from = math.max(1, from)
-  to = math.min(#list, to)
-  for i = from, to do
-    table.insert(out, list[i])
-  end
-  return out
-end
-
 -- Resolve an anchor against the current buffer contents. Pure: never mutates
 -- `record`. Returns a result table:
 --   { line_start = N|nil, line_end = N|nil, drift = "none"|"shifted"|"lost"|"file" }
@@ -525,11 +519,15 @@ end
 -- `buf_lines` is a 1-indexed array of strings. `current_blob` is the optional
 -- short SHA of the file's blob in the current HEAD; if both it and the
 -- anchor's stored blob match, we short-circuit with drift = "none".
-function M.resolve_anchor(record, buf_lines, current_blob)
+--
+-- For batched calls against the same buffer (e.g. resolving every record on
+-- BufReadPost), pass `buf_norm` — the buffer's already-normalized lines — to
+-- avoid re-running the gsub pipeline once per record. When omitted, we
+-- normalize in-place.
+function M.resolve_anchor(record, buf_lines, current_blob, buf_norm)
   if type(record) ~= 'table' then
     return { line_start = nil, line_end = nil, drift = 'none' }
   end
-  -- File-level note: no line numbers.
   if record.scope == 'file' then
     return { line_start = nil, line_end = nil, drift = 'file' }
   end
@@ -538,7 +536,6 @@ function M.resolve_anchor(record, buf_lines, current_blob)
   if type(stored_start) ~= 'number' or type(stored_end) ~= 'number' then
     return { line_start = stored_start, line_end = stored_end, drift = 'none' }
   end
-  -- Legacy record (no anchor): trust stored line numbers.
   local anchor = record.anchor
   if type(anchor) ~= 'table' or type(anchor.lines) ~= 'table' or #anchor.lines == 0 then
     return { line_start = stored_start, line_end = stored_end, drift = 'none' }
@@ -547,8 +544,6 @@ function M.resolve_anchor(record, buf_lines, current_blob)
     return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
   end
 
-  -- Blob fast path. If the stored blob matches the file's current blob, the
-  -- file is byte-identical to creation time — stored lines must be correct.
   if anchor.blob and current_blob and anchor.blob ~= '' and anchor.blob == current_blob then
     return { line_start = stored_start, line_end = stored_end, drift = 'none' }
   end
@@ -557,41 +552,69 @@ function M.resolve_anchor(record, buf_lines, current_blob)
   local ctx_before = normalize_list(anchor.ctx_before or {})
   local ctx_after = normalize_list(anchor.ctx_after or {})
   local nlen = #anchor_lines
+  local nbefore = #ctx_before
+  local nafter = #ctx_after
 
-  -- Exact-position check.
-  local cur_at_stored = {}
-  for i = stored_start, stored_end do
-    table.insert(cur_at_stored, M.normalize_anchor_line(buf_lines[i] or ''))
-  end
-  if exact_line_matches(anchor_lines, cur_at_stored) == nlen and #cur_at_stored == nlen then
-    return { line_start = stored_start, line_end = stored_end, drift = 'none' }
+  -- Pre-normalize the entire buffer once. The windowed search below is
+  -- O(window * (nlen + ctx)) reads against this array — without this, every
+  -- candidate position re-runs the gsubs on overlapping lines.
+  local nbuf = #buf_lines
+  if buf_norm == nil then
+    buf_norm = {}
+    for i = 1, nbuf do
+      buf_norm[i] = M.normalize_anchor_line(buf_lines[i])
+    end
   end
 
-  -- Windowed search for the best match nearby.
+  -- exact_at(c): count of body lines matching buf_norm at start c.
+  local function body_matches_at(c)
+    local m = 0
+    for k = 1, nlen do
+      if buf_norm[c + k - 1] == anchor_lines[k] then
+        m = m + 1
+      end
+    end
+    return m
+  end
+
+  if stored_start >= 1 and stored_end <= nbuf and (stored_end - stored_start + 1) == nlen then
+    if body_matches_at(stored_start) == nlen then
+      return { line_start = stored_start, line_end = stored_end, drift = 'none' }
+    end
+  end
+
   local window = math.max(50, 2 * nlen)
   local lo = math.max(1, stored_start - window)
-  local hi = math.min(#buf_lines - nlen + 1, stored_start + window)
+  local hi = math.min(nbuf - nlen + 1, stored_start + window)
   if hi < 1 then
     return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
   end
 
   local best_score = -1
+  local best_body = -1
   local best_start
   local best_dist = math.huge
   for c = lo, hi do
-    local body = slice(buf_lines, c, c + nlen - 1)
-    local body_norm = normalize_list(body)
-    local body_score = exact_line_matches(anchor_lines, body_norm)
-    local before = slice(buf_lines, c - #ctx_before, c - 1)
-    local before_norm = normalize_list(before)
-    local before_score = exact_line_matches(ctx_before, before_norm)
-    local after = slice(buf_lines, c + nlen, c + nlen + #ctx_after - 1)
-    local after_norm = normalize_list(after)
-    local after_score = exact_line_matches(ctx_after, after_norm)
+    local body_score = body_matches_at(c)
+    local before_score = 0
+    for k = 1, nbefore do
+      local idx = c - nbefore + k - 1
+      if idx >= 1 and buf_norm[idx] == ctx_before[k] then
+        before_score = before_score + 1
+      end
+    end
+    local after_score = 0
+    for k = 1, nafter do
+      local idx = c + nlen + k - 1
+      if idx <= nbuf and buf_norm[idx] == ctx_after[k] then
+        after_score = after_score + 1
+      end
+    end
     local score = body_score + 0.5 * before_score + 0.5 * after_score
     local dist = math.abs(c - stored_start)
     if score > best_score or (score == best_score and dist < best_dist) then
       best_score = score
+      best_body = body_score
       best_start = c
       best_dist = dist
     end
@@ -601,13 +624,10 @@ function M.resolve_anchor(record, buf_lines, current_blob)
     return { line_start = stored_start, line_end = stored_end, drift = 'lost' }
   end
 
-  -- Decide: full body match → shifted; >= 70% body match → shifted; else lost.
-  -- We compute body-only score for the threshold (context contributes to
-  -- tie-breaking but shouldn't carry a partial body match over the line).
-  local matched_body = slice(buf_lines, best_start, best_start + nlen - 1)
-  local body_only_score = exact_line_matches(anchor_lines, normalize_list(matched_body))
+  -- Threshold uses body-only score: context contributes to tie-breaking but
+  -- shouldn't carry a partial body match over the line.
   local threshold = math.max(1, math.ceil(0.7 * nlen))
-  if body_only_score >= threshold then
+  if best_body >= threshold then
     return {
       line_start = best_start,
       line_end = best_start + nlen - 1,
