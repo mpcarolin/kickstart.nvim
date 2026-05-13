@@ -79,18 +79,56 @@ function M.current_branch(git_dir)
   if not git_dir or git_dir == '' then
     return nil
   end
-  local name = sh(string.format('git --git-dir=%q rev-parse --abbrev-ref HEAD', git_dir))
+  local g = string.format('git --git-dir=%q ', git_dir)
+
+  local name = sh(g .. 'rev-parse --abbrev-ref HEAD')
   if not name or name == '' then
     return nil
   end
-  if name == 'HEAD' then
-    local sha = sh(string.format('git --git-dir=%q rev-parse --short=12 HEAD', git_dir))
+  if name ~= 'HEAD' then
+    return name
+  end
+
+  local out = sh(g .. "for-each-ref refs/heads/ --contains HEAD --format='%(refname:short)'")
+  local candidates = {}
+  if out and out ~= '' then
+    for line in out:gmatch('[^\n]+') do
+      local b = line:gsub('^%s+', ''):gsub('%s+$', '')
+      if b ~= '' then
+        table.insert(candidates, b)
+      end
+    end
+  end
+
+  if #candidates == 0 then
+    local sha = sh(g .. 'rev-parse --short=12 HEAD')
     if not sha or sha == '' then
       return nil
     end
     return sha
   end
-  return name
+
+  local prev_full = sh(g .. "rev-parse --symbolic-full-name '@{-1}'")
+  if prev_full and prev_full:match('^refs/heads/') then
+    local prev = prev_full:gsub('^refs/heads/', '')
+    for _, c in ipairs(candidates) do
+      if c == prev then
+        return c
+      end
+    end
+  end
+
+  if #candidates == 1 then
+    return candidates[1]
+  end
+
+  table.sort(candidates)
+  for _, c in ipairs(candidates) do
+    if c ~= 'main' and c ~= 'master' then
+      return c
+    end
+  end
+  return candidates[1]
 end
 
 -- Resolve the short HEAD SHA, mirroring `current_branch`. Returns the trimmed
