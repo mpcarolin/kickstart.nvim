@@ -15,6 +15,8 @@ return {
   },
   lazy = false,
   config = function()
+    local M = {}
+
     local function resolve_claude_bufnr()
       local ok, cc = pcall(require, 'claude-code')
       if not ok then return nil, 'claude-code.nvim not loaded' end
@@ -54,14 +56,20 @@ return {
         return
       end
 
-      if #vim.fn.win_findbuf(bufnr) == 0 then
-        local cur_win = vim.api.nvim_get_current_win()
-        vim.cmd('vertical sbuffer ' .. bufnr)
-        vim.api.nvim_set_current_win(cur_win)
-      end
-
+      -- intentionally NOT revealing a hidden Claude buffer; user wants to drive
+      -- the session through arbiter comments only.
       vim.fn.chansend(job_id, 'arbitrate\r')
       vim.notify('arbiter: triggered claude review', vim.log.levels.INFO)
+    end
+
+    function M.notify_ready(opts)
+      opts = opts or {}
+      local count = tonumber(opts.count) or 0
+      vim.notify(
+        string.format('arbiter: %d note%s ready for re-review', count, count == 1 and '' or 's'),
+        vim.log.levels.INFO,
+        { title = 'arbiter', icon = '✓', timeout = 5000, hl_group = 'DiagnosticOk' }
+      )
     end
 
     vim.api.nvim_create_user_command('ArbiterTriggerReview', trigger, {
@@ -71,5 +79,7 @@ return {
     vim.keymap.set('n', '<leader>gT', trigger, {
       desc = 'arbiter: [T]rigger Claude review of notes',
     })
+
+    package.loaded['arbiter-claude'] = M
   end,
 }
