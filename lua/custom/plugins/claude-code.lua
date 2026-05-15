@@ -10,7 +10,8 @@ return {
         position = 'vertical',
         split_ratio = 0.3,
         enter_insert = true,
-        hide_numers = true,
+        start_in_normal_mode = true,
+        hide_numbers = true,
         hide_signcolumn = true,
       },
       -- Keymaps
