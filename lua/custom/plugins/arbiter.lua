@@ -62,21 +62,10 @@ return {
 
     local M = {}
 
-    -- Resolve (jsonl_path, repo_root, git_dir, err). Tries fugitive first,
-    -- falls back to .git discovery from cwd. err is a string when something
-    -- failed; jsonl_path is otherwise <git_dir>/arbiter.jsonl.
+    -- Resolve (jsonl_path, repo_root, git_dir, err). err is a string when
+    -- something failed; jsonl_path is otherwise <git_dir>/arbiter.jsonl.
     local function resolve_paths()
-      local repo_root, git_dir
-      local ok_f, repo = pcall(vim.fn.FugitiveGitDir)
-      if ok_f and type(repo) == 'string' and repo ~= '' then
-        git_dir = repo
-        -- repo_root = parent of .git for a regular repo. Use vim.fs.dirname
-        -- since core.find_git_root would shell out unnecessarily.
-        repo_root = vim.fs.dirname(repo)
-      else
-        local cwd = vim.fn.getcwd()
-        git_dir, repo_root = core.find_git_root(cwd)
-      end
+      local git_dir, repo_root = core.find_git_root(vim.fn.getcwd())
       if not repo_root or not git_dir then
         return nil, nil, nil, 'not inside a git repo'
       end
@@ -673,13 +662,7 @@ return {
         line_start = pos.line_start
         line_end = pos.line_end
         deletions_only = pos.deletions_only
-        local ok_f, repo = pcall(vim.fn.FugitiveGitDir)
-        if ok_f and type(repo) == 'string' and repo ~= '' then
-          git_dir = repo
-          repo_root = vim.fs.dirname(repo)
-        else
-          git_dir, repo_root = core.find_git_root(vim.fn.getcwd())
-        end
+        git_dir, repo_root = core.find_git_root(vim.fn.getcwd())
         commit = fugitive_commit_sha(bufnr, git_dir)
       else
         if bufname == '' then

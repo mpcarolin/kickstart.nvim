@@ -35,7 +35,7 @@ vim.g.mapleader = ' '
 vim.g.maplocalleader = ' '
 
 -- Load per-machine config (gitignored, sibling of init.lua). No-op if file is absent.
-pcall(dofile, vim.fn.stdpath('config') .. '/env.lua')
+pcall(dofile, vim.fn.stdpath 'config' .. '/env.lua')
 
 -- Set to true if you have a Nerd Font installed and selected in the terminal
 vim.g.have_nerd_font = false
@@ -485,8 +485,13 @@ require('lazy').setup({
         local cutoff = os.time() - (14 * 24 * 60 * 60)
         local current_branch = vim.fn.system({ 'git', '-C', buf_dir, 'branch', '--show-current' }):gsub('%s+', '')
         local output = vim.fn.system {
-          'git', '-C', buf_dir, 'for-each-ref', 'refs/heads/',
-          '--sort=-committerdate', '--format=%(refname:short)\t%(committerdate:unix)\t%(committerdate:relative)',
+          'git',
+          '-C',
+          buf_dir,
+          'for-each-ref',
+          'refs/heads/',
+          '--sort=-committerdate',
+          '--format=%(refname:short)\t%(committerdate:unix)\t%(committerdate:relative)',
         }
         local branches = {}
         local current_entry = nil
@@ -581,7 +586,14 @@ require('lazy').setup({
 
                 -- Git log graph
                 local log = vim.fn.systemlist {
-                  'git', '-C', buf_dir, 'log', '--oneline', '--graph', '-20', branch,
+                  'git',
+                  '-C',
+                  buf_dir,
+                  'log',
+                  '--oneline',
+                  '--graph',
+                  '-20',
+                  branch,
                 }
                 for _, line in ipairs(log) do
                   table.insert(header, line)
