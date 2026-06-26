@@ -616,92 +616,6 @@ require('lazy').setup({
           :find()
       end, { desc = 'Git branches (recent first)' })
 
-      -- Telescope picker of just the open Neovim terminal buffers
-      local function terminal_picker()
-        local pickers = require 'telescope.pickers'
-        local finders = require 'telescope.finders'
-        local previewers = require 'telescope.previewers'
-        local conf = require('telescope.config').values
-        local actions = require 'telescope.actions'
-        local action_state = require 'telescope.actions.state'
-
-        local terminals = {}
-        for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-          if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == 'terminal' then
-            local name = vim.api.nvim_buf_get_name(buf)
-            -- terminal buffer names look like: term://<cwd>//<pid>:<cmd>
-            local cmd = name:match 'term://.-//%d+:(.*)' or name
-            local cwd = name:match 'term://(.-)//' or ''
-            cwd = vim.fn.fnamemodify(cwd, ':~')
-            table.insert(terminals, {
-              bufnr = buf,
-              cmd = cmd,
-              cwd = cwd,
-            })
-          end
-        end
-
-        if #terminals == 0 then
-          vim.notify('No terminal buffers open', vim.log.levels.INFO)
-          return
-        end
-
-        pickers
-          .new({}, {
-            prompt_title = 'Terminals',
-            finder = finders.new_table {
-              results = terminals,
-              entry_maker = function(entry)
-                local displayer = require('telescope.pickers.entry_display').create {
-                  separator = ' ',
-                  items = {
-                    { width = 5 },
-                    { remaining = true },
-                    { remaining = true },
-                  },
-                }
-                local dim = 'TelescopeResultsComment'
-                return {
-                  value = entry,
-                  bufnr = entry.bufnr,
-                  display = function()
-                    return displayer {
-                      { '#' .. entry.bufnr, 'TelescopeResultsNumber' },
-                      entry.cmd,
-                      { entry.cwd, dim },
-                    }
-                  end,
-                  ordinal = entry.bufnr .. ' ' .. entry.cmd .. ' ' .. entry.cwd,
-                }
-              end,
-            },
-            sorter = conf.generic_sorter {},
-            previewer = previewers.new_buffer_previewer {
-              title = 'Terminal',
-              define_preview = function(self, entry)
-                local lines = vim.api.nvim_buf_get_lines(entry.bufnr, 0, -1, false)
-                vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
-              end,
-            },
-            attach_mappings = function(prompt_bufnr)
-              actions.select_default:replace(function()
-                local selection = action_state.get_selected_entry()
-                actions.close(prompt_bufnr)
-                if selection then
-                  vim.api.nvim_set_current_buf(selection.bufnr)
-                end
-              end)
-              return true
-            end,
-          })
-          :find()
-      end
-      vim.keymap.set('n', '<C-t>', terminal_picker, { desc = 'Find terminals' })
-      vim.keymap.set('t', '<C-t>', function()
-        vim.cmd 'stopinsert'
-        terminal_picker()
-      end, { desc = 'Find terminals' })
-
       -- Slightly advanced example of overriding default behavior and theme
       vim.keymap.set('n', '<leader>/', function()
         -- You can pass additional configuration to Telescope to change the theme, layout, etc.
@@ -1205,17 +1119,22 @@ require('lazy').setup({
           -- no git branch, and the filename truncates last.
           active = function()
             local mode, mode_hl = statusline.section_mode { trunc_width = 120 }
+            local git = statusline.section_git { trunc_width = 75, icon = '' }
+            local diff = statusline.section_diff { trunc_width = 75, icon = '' }
             local diagnostics = statusline.section_diagnostics { trunc_width = 75 }
             local lsp = statusline.section_lsp { trunc_width = 75 }
             local filename = statusline.section_filename { trunc_width = 99999 }
-            local fileinfo = statusline.section_fileinfo { trunc_width = 120 }
             local location = statusline.section_location { trunc_width = 75 }
+
+            -- Fileinfo: filetype only (drop encoding/format and size).
+            local fileinfo = vim.bo.filetype
 
             return statusline.combine_groups {
               { hl = mode_hl, strings = { mode } },
               { hl = 'MiniStatuslineFilename', strings = { filename } },
+              '%<', -- truncate from HERE leftward; filename + mode are protected
+              { hl = 'MiniStatuslineDevinfo', strings = { git, diff } },
               { hl = 'MiniStatuslineFileinfo', strings = { fileinfo } },
-              '%<', -- truncate from HERE leftward, so everything left of it is protected
               { hl = 'MiniStatuslineDevinfo', strings = { diagnostics, lsp } },
               '%=', -- right align
               { hl = mode_hl, strings = { location } },
@@ -1234,6 +1153,14 @@ require('lazy').setup({
 
       -- ... and there is more!
       --  Check out: https://github.com/echasnovski/mini.nvim
+    end,
+  },
+  { -- Command-line enhancements (autocomplete, autocorrect, autopeek)
+    'nvim-mini/mini.cmdline',
+    version = '*', -- stable branch
+    event = 'VeryLazy',
+    config = function()
+      require('mini.cmdline').setup()
     end,
   },
   { -- Highlight, edit, and navigate code
@@ -1332,9 +1259,13 @@ vim.keymap.set('n', '<leader>m', function()
   harpoon.ui:toggle_quick_menu(harpoon:list())
 end)
 
-vim.keymap.set('n', '<C-t>', function()
-  harpoon:list():select(1)
-end)
+-- Open the toggleterm manager picker; require() forces the spec to load on demand
+vim.keymap.set({ 'n', 't' }, '<C-t>', function()
+  if vim.fn.mode() == 't' then
+    vim.cmd 'stopinsert'
+  end
+  require('toggleterm-manager').open {}
+end, { desc = 'Terminal manager (telescope)' })
 
 -- Toggle previous & next buffers stored within Harpoon list
 vim.keymap.set('n', '<C-S-P>', function()
