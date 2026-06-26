@@ -169,37 +169,7 @@ vim.keymap.set('n', '<leader>ii', function()
   vim.cmd 'edit ~/Development/notes/scratch.md'
 end, { desc = 'Open scratch notes' })
 
--- Toggle terminal in vertical split
-local terminal_bufnr = nil
-local terminal_winnr = nil
-vim.keymap.set('n', '<leader>tt', function()
-  -- Check if we have a terminal buffer that still exists
-  if terminal_bufnr and vim.api.nvim_buf_is_valid(terminal_bufnr) then
-    -- Check if terminal is currently visible
-    local win_found = false
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      if vim.api.nvim_win_get_buf(win) == terminal_bufnr then
-        -- Terminal is visible, hide it
-        vim.api.nvim_win_hide(win)
-        win_found = true
-        break
-      end
-    end
-
-    -- If terminal wasn't visible, show it again
-    if not win_found then
-      vim.cmd 'vsplit'
-      vim.api.nvim_win_set_buf(0, terminal_bufnr)
-      vim.cmd 'startinsert'
-    end
-  else
-    -- No terminal buffer exists, create a new one
-    vim.cmd 'vsplit'
-    vim.cmd 'term'
-    terminal_bufnr = vim.api.nvim_get_current_buf()
-    vim.cmd 'startinsert'
-  end
-end, { desc = '[T]oggle [T]erminal' })
+-- Terminal toggling handled by toggleterm.nvim (lua/custom/plugins/toggleterm.lua)
 
 -- TIP: Disable arrow keys in normal mode
 -- vim.keymap.set('n', '<left>', '<cmd>echo "Use h to move!!"<CR>')
@@ -470,6 +440,7 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>sr', builtin.resume, { desc = '[S]earch [R]esume' })
       vim.keymap.set('n', '<leader>s.', builtin.oldfiles, { desc = '[S]earch Recent Files ("." for repeat)' })
       vim.keymap.set('n', '<leader><leader>', builtin.buffers, { desc = '[ ] Find existing buffers' })
+      vim.keymap.set('n', '<C-s>', builtin.buffers, { desc = 'Find existing buffers' })
 
       -- Git branches sorted by most recent commit, using the current buffer's repo
       vim.keymap.set('n', '<C-g>', function()
@@ -644,6 +615,92 @@ require('lazy').setup({
           })
           :find()
       end, { desc = 'Git branches (recent first)' })
+
+      -- Telescope picker of just the open Neovim terminal buffers
+      local function terminal_picker()
+        local pickers = require 'telescope.pickers'
+        local finders = require 'telescope.finders'
+        local previewers = require 'telescope.previewers'
+        local conf = require('telescope.config').values
+        local actions = require 'telescope.actions'
+        local action_state = require 'telescope.actions.state'
+
+        local terminals = {}
+        for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+          if vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == 'terminal' then
+            local name = vim.api.nvim_buf_get_name(buf)
+            -- terminal buffer names look like: term://<cwd>//<pid>:<cmd>
+            local cmd = name:match 'term://.-//%d+:(.*)' or name
+            local cwd = name:match 'term://(.-)//' or ''
+            cwd = vim.fn.fnamemodify(cwd, ':~')
+            table.insert(terminals, {
+              bufnr = buf,
+              cmd = cmd,
+              cwd = cwd,
+            })
+          end
+        end
+
+        if #terminals == 0 then
+          vim.notify('No terminal buffers open', vim.log.levels.INFO)
+          return
+        end
+
+        pickers
+          .new({}, {
+            prompt_title = 'Terminals',
+            finder = finders.new_table {
+              results = terminals,
+              entry_maker = function(entry)
+                local displayer = require('telescope.pickers.entry_display').create {
+                  separator = ' ',
+                  items = {
+                    { width = 5 },
+                    { remaining = true },
+                    { remaining = true },
+                  },
+                }
+                local dim = 'TelescopeResultsComment'
+                return {
+                  value = entry,
+                  bufnr = entry.bufnr,
+                  display = function()
+                    return displayer {
+                      { '#' .. entry.bufnr, 'TelescopeResultsNumber' },
+                      entry.cmd,
+                      { entry.cwd, dim },
+                    }
+                  end,
+                  ordinal = entry.bufnr .. ' ' .. entry.cmd .. ' ' .. entry.cwd,
+                }
+              end,
+            },
+            sorter = conf.generic_sorter {},
+            previewer = previewers.new_buffer_previewer {
+              title = 'Terminal',
+              define_preview = function(self, entry)
+                local lines = vim.api.nvim_buf_get_lines(entry.bufnr, 0, -1, false)
+                vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
+              end,
+            },
+            attach_mappings = function(prompt_bufnr)
+              actions.select_default:replace(function()
+                local selection = action_state.get_selected_entry()
+                actions.close(prompt_bufnr)
+                if selection then
+                  vim.api.nvim_set_current_buf(selection.bufnr)
+                end
+              end)
+              return true
+            end,
+          })
+          :find()
+      end
+      vim.keymap.set('n', '<C-t>', terminal_picker, { desc = 'Find terminals' })
+      vim.keymap.set('t', '<C-t>', function()
+        vim.cmd 'stopinsert'
+        terminal_picker()
+      end, { desc = 'Find terminals' })
 
       -- Slightly advanced example of overriding default behavior and theme
       vim.keymap.set('n', '<leader>/', function()
@@ -1110,7 +1167,8 @@ require('lazy').setup({
       -- Load the colorscheme here.
       -- Like many other themes, this one has different styles, and you could load
       -- any other, such as 'tokyonight-storm', 'tokyonight-moon', or 'tokyonight-day'.
-      vim.cmd.colorscheme 'tokyonight-moon'
+      -- vim.cmd.colorscheme 'tokyonight-moon'
+      vim.cmd.colorscheme 'everforest'
     end,
   },
 
@@ -1140,7 +1198,31 @@ require('lazy').setup({
       --  and try some other statusline plugin
       local statusline = require 'mini.statusline'
       -- set use_icons to true if you have a Nerd Font
-      statusline.setup { use_icons = vim.g.have_nerd_font }
+      statusline.setup {
+        use_icons = vim.g.have_nerd_font,
+        content = {
+          -- Custom active content: filename takes precedence over everything,
+          -- no git branch, and the filename truncates last.
+          active = function()
+            local mode, mode_hl = statusline.section_mode { trunc_width = 120 }
+            local diagnostics = statusline.section_diagnostics { trunc_width = 75 }
+            local lsp = statusline.section_lsp { trunc_width = 75 }
+            local filename = statusline.section_filename { trunc_width = 99999 }
+            local fileinfo = statusline.section_fileinfo { trunc_width = 120 }
+            local location = statusline.section_location { trunc_width = 75 }
+
+            return statusline.combine_groups {
+              { hl = mode_hl, strings = { mode } },
+              { hl = 'MiniStatuslineFilename', strings = { filename } },
+              { hl = 'MiniStatuslineFileinfo', strings = { fileinfo } },
+              '%<', -- truncate from HERE leftward, so everything left of it is protected
+              { hl = 'MiniStatuslineDevinfo', strings = { diagnostics, lsp } },
+              '%=', -- right align
+              { hl = mode_hl, strings = { location } },
+            }
+          end,
+        },
+      }
 
       -- You can configure sections in the statusline by overriding their
       -- default behavior. For example, here we set the section for

@@ -14,6 +14,6 @@ return {
     end,
   },
   keys = {
-    { '<leader>ts', '<cmd>AerialToggle!<CR>', desc = '[T]oggle Aerial [S]ymbols' },
+    { '<leader>ty', '<cmd>AerialToggle!<CR>', desc = '[T]oggle Aerial s[Y]mbols' },
   },
 }
