@@ -849,10 +849,13 @@ require('lazy').setup({
       --  - capabilities (table): Override fields in capabilities. Can be used to disable certain LSP features.
       --  - settings (table): Override the default settings passed when initializing the server.
       --        For example, to see the options for `lua_ls`, you could go to: https://luals.github.io/wiki/settings/
+      -- Per-machine language toggles (set in env.lua; see env.template.lua).
+      -- Go/Python default ON (opt out with `false`); C defaults OFF (opt in with `true`).
+      local enable_go = vim.g.enable_go ~= false
+      local enable_python = vim.g.enable_python ~= false
+      local enable_c = vim.g.enable_c == true
+
       local servers = {
-        -- clangd = {},
-        gopls = {},
-        pyright = {},
         -- rust_analyzer = {},
         -- ... etc. See `:help lspconfig-all` for a list of all the pre-configured LSPs
         --
@@ -886,6 +889,21 @@ require('lazy').setup({
           },
         },
       }
+
+      -- Language servers gated by the per-machine toggles above. Gated-out servers
+      -- are never added to `servers`, so mason-tool-installer never installs them
+      -- and they never start. Zero footprint on machines that don't opt in.
+      if enable_go then
+        servers.gopls = {}
+      end
+      if enable_python then
+        servers.pyright = {}
+      end
+      if enable_c then
+        -- clangd: completion, diagnostics, jump-to-def. Reads compile_commands.json
+        -- or compile_flags.txt to learn include paths.
+        servers.clangd = {}
+      end
 
       -- Ensure the servers and tools above are installed
       --

@@ -16,3 +16,12 @@ vim.g.todo_file = vim.fn.expand('~/Development/todo.md')
 -- "notes" source tab and <leader>n toggles the sidebar to it. If unset,
 -- <leader>n shows a notify and does nothing.
 -- vim.g.notes_dir = vim.fn.expand('~/Development/notes')
+
+-- Language tooling toggles. Go and Python default ON; set to false to disable
+-- their LSP servers (gopls / pyright) on this machine.
+-- vim.g.enable_go = false
+-- vim.g.enable_python = false
+
+-- C tooling (clangd LSP + overseer build/run + nvim-dap debugging) defaults OFF.
+-- Set to true on machines where you do C development.
+-- vim.g.enable_c = true
