@@ -51,9 +51,24 @@ local function sh(cmd)
   return (out:gsub('%s+$', ''))
 end
 
+-- Memoized directory -> (git_dir, repo_root). A directory's repo membership
+-- only changes if the directory itself is moved or the repo is re-inited, so
+-- this is safe to hold for the life of the process. `M.clear_caches()` drops
+-- it for the rare case where that happens.
+local git_root_cache = {}
+
 -- Resolve absolute git_dir + repo_root from cwd. Returns (git_dir, repo_root)
 -- or nil. `--absolute-git-dir` handles worktrees and submodule .git files.
 function M.find_git_root(cwd)
+  local key = (cwd and cwd ~= '') and cwd or '<cwd>'
+  local hit = git_root_cache[key]
+  if hit then
+    if hit.miss then
+      return nil, nil
+    end
+    return hit.git_dir, hit.repo_root
+  end
+
   local git_dir, repo_root
   if cwd and cwd ~= '' then
     git_dir = sh(string.format('cd %q && git rev-parse --absolute-git-dir', cwd))
@@ -63,8 +78,12 @@ function M.find_git_root(cwd)
     repo_root = sh 'git rev-parse --show-toplevel'
   end
   if not git_dir or git_dir == '' or not repo_root or repo_root == '' then
+    -- Cache the negative too: non-repo directories are re-visited just as
+    -- often and cost the same two forks to re-discover.
+    git_root_cache[key] = { miss = true }
     return nil, nil
   end
+  git_root_cache[key] = { git_dir = git_dir, repo_root = repo_root }
   return git_dir, repo_root
 end
 
@@ -75,10 +94,57 @@ function M.resolve_jsonl_path(git_dir)
   return git_dir .. '/arbiter.jsonl'
 end
 
+-- mtime of a file as a number, or nil. Uses `vim.uv` when running inside
+-- nvim, else falls back to a stat shell-out only if that is unavailable.
+local function file_mtime(path)
+  local uv = (type(vim) == 'table' and (vim.uv or vim.loop)) or nil
+  if uv then
+    local st = uv.fs_stat(path)
+    if not st then
+      return nil
+    end
+    -- nsec resolution when available so same-second writes still invalidate.
+    local m = st.mtime
+    return (m.sec or 0) + ((m.nsec or 0) / 1e9)
+  end
+  return nil
+end
+
+-- git_dir -> { key = <HEAD mtime>, branch = <name> }. HEAD is rewritten by
+-- checkout/switch/rebase/detach, so its mtime is a correct invalidation key
+-- for "which branch am I on". When mtime is unavailable we skip the cache
+-- entirely rather than risk serving a stale branch.
+local branch_cache = {}
+
 function M.current_branch(git_dir)
   if not git_dir or git_dir == '' then
     return nil
   end
+
+  local head_mtime = file_mtime(git_dir .. '/HEAD')
+  if head_mtime then
+    local hit = branch_cache[git_dir]
+    if hit and hit.key == head_mtime then
+      return hit.branch
+    end
+  end
+
+  local branch = M._current_branch_uncached(git_dir)
+  if head_mtime then
+    branch_cache[git_dir] = { key = head_mtime, branch = branch }
+  end
+  return branch
+end
+
+-- Drop every memoized value. Call after an operation that could move a
+-- directory between repos or re-init a repo.
+function M.clear_caches()
+  git_root_cache = {}
+  branch_cache = {}
+  M._jsonl_cache = {}
+end
+
+function M._current_branch_uncached(git_dir)
   local g = string.format('git --git-dir=%q ', git_dir)
 
   local name = sh(g .. 'rev-parse --abbrev-ref HEAD')
@@ -385,7 +451,34 @@ end
 -- IO: read / append / atomic rewrite.
 -- =====================================================================
 
-function M.read_jsonl(path)
+-- path -> { key = "<mtime>:<size>", records = {...} }. The JSONL is only ever
+-- written by append_jsonl / rewrite_jsonl (below) and by the external CLI,
+-- both of which change mtime and/or size, so (mtime, size) is a sound key.
+-- Writers in this module also invalidate explicitly, which covers the case of
+-- a same-nanosecond same-size rewrite.
+M._jsonl_cache = {}
+
+local function jsonl_key(path)
+  local uv = (type(vim) == 'table' and (vim.uv or vim.loop)) or nil
+  if not uv then
+    return nil
+  end
+  local st = uv.fs_stat(path)
+  if not st then
+    return nil
+  end
+  local m = st.mtime
+  return string.format('%d.%09d:%d', m.sec or 0, m.nsec or 0, st.size or 0)
+end
+
+-- Invalidate the cached decode of `path`. Called by every writer here.
+function M.invalidate_jsonl(path)
+  if path then
+    M._jsonl_cache[path] = nil
+  end
+end
+
+local function read_jsonl_uncached(path)
   local f = io.open(path, 'r')
   if not f then
     return {}
@@ -403,6 +496,30 @@ function M.read_jsonl(path)
   return records
 end
 
+function M.read_jsonl(path)
+  local key = jsonl_key(path)
+  if not key then
+    -- No stat available (missing file, or running outside nvim): no safe
+    -- cache key, so always re-read.
+    return read_jsonl_uncached(path)
+  end
+  local hit = M._jsonl_cache[path]
+  if not (hit and hit.key == key) then
+    hit = { key = key, records = read_jsonl_uncached(path) }
+    M._jsonl_cache[path] = hit
+  end
+  -- Hand back a fresh outer list. Callers such as `append_reply` +
+  -- `rewrite_jsonl` mutate the list they are given (insert/remove/reorder);
+  -- copying the spine keeps those edits from rewriting the cached decode.
+  -- Record tables are still shared, so a caller that edits a record in place
+  -- must call `invalidate_jsonl` — every writer in this module does.
+  local out = {}
+  for i = 1, #hit.records do
+    out[i] = hit.records[i]
+  end
+  return out
+end
+
 function M.append_jsonl(path, record)
   local ok_e, encoded = pcall(cjson.encode, record)
   if not ok_e then
@@ -414,6 +531,7 @@ function M.append_jsonl(path, record)
   end
   f:write(encoded .. '\n')
   f:close()
+  M.invalidate_jsonl(path)
   return true
 end
 
@@ -723,6 +841,7 @@ function M.rewrite_jsonl(path, records)
     os.remove(tmp)
     return false, rename_err
   end
+  M.invalidate_jsonl(path)
   return true
 end
 
