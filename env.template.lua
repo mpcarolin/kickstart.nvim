@@ -10,12 +10,16 @@
 -- This file should only be updated to document new variables that env.lua may set.
 
 -- Path to your personal todo file, opened by <leader>ko (checkmate.nvim).
-vim.g.todo_file = vim.fn.expand('~/Development/todo.md')
+vim.g.todo_file = vim.fn.expand '~/Development/todo.md'
 
 -- Path to your personal notes directory. When set, Neo-tree gains a
 -- "notes" source tab and <leader>n toggles the sidebar to it. If unset,
 -- <leader>n shows a notify and does nothing.
 -- vim.g.notes_dir = vim.fn.expand('~/Development/notes')
+
+-- Path to your tasks directory, shown as Neo-tree's "tasks" source tab.
+-- Defaults to ~/Development/tasks; override here to point elsewhere.
+-- vim.g.tasks_dir = vim.fn.expand('~/Development/tasks')
 
 -- Language tooling toggles. Go and Python default ON; set to false to disable
 -- their LSP servers (gopls / pyright) on this machine.
@@ -25,3 +29,16 @@ vim.g.todo_file = vim.fn.expand('~/Development/todo.md')
 -- C tooling (clangd LSP + overseer build/run + nvim-dap debugging) defaults OFF.
 -- Set to true on machines where you do C development.
 -- vim.g.enable_c = true
+
+-- Database connections for vim-dadbod-ui (:DBUI). Machine-specific, so they
+-- live here rather than in a committed plugin file. Each `url` is a FUNCTION so
+-- resolution is deferred until dadbod actually opens the connection — nothing
+-- runs at startup. Wrap urls holding `op://` refs in `require('custom.op').inject`
+-- so the 1Password CLI (`op read`) resolves them on demand (see lua/custom/op.lua).
+-- inject() short-circuits ref-free strings, so plaintext urls can be wrapped
+-- uniformly. Requires the 1Password desktop app to be unlocked.
+-- local op = require 'custom.op'
+-- vim.g.dbs = {
+--   { name = 'dev', url = function() return op.inject(vim.env.devdburl) end },
+--   { name = 'test',        url = function() return op.inject(vim.env.testdburl) end },
+-- }
