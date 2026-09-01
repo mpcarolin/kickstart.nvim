@@ -6,3 +6,5 @@ nvim
 spell/
 
 env.lua
+.swp/
+.undo/
