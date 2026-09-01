@@ -1,4 +1,6 @@
 local notes_dir = vim.g.notes_dir
+local tasks_dir = vim.g.tasks_dir or vim.fn.expand('~/Development/tasks')
+vim.g.tasks_dir = tasks_dir
 
 return {
   'nvim-neo-tree/neo-tree.nvim',
@@ -15,8 +17,8 @@ return {
     sources = {
       'filesystem',
       'buffers',
-      'git_status',
       'custom.neo_tree_sources.notes',
+      'custom.neo_tree_sources.tasks',
     },
     source_selector = {
       winbar = false,
@@ -25,7 +27,7 @@ return {
       sources = {
         { source = 'filesystem',  display_name = ' 󰉓 ' },
         { source = 'notes',       display_name = ' 󰠮 ' },
-        { source = 'git_status',  display_name = ' 󰊢 ' },
+        { source = 'tasks',       display_name = ' 󰄬 ' },
         { source = 'buffers',     display_name = ' 󰈚 ' },
       },
     },
@@ -33,6 +35,10 @@ return {
   config = function(_, opts)
     local fs_defaults = require('neo-tree.defaults').filesystem
     opts.notes = vim.tbl_deep_extend('force', vim.deepcopy(fs_defaults), {
+      bind_to_cwd = false,
+      follow_current_file = { enabled = false },
+    })
+    opts.tasks = vim.tbl_deep_extend('force', vim.deepcopy(fs_defaults), {
       bind_to_cwd = false,
       follow_current_file = { enabled = false },
     })
