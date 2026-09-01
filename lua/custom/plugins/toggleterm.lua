@@ -39,6 +39,7 @@ return {
     -- send current line / visual selection to the terminal
     { '<leader>tl', '<cmd>ToggleTermSendCurrentLine<CR>', desc = '[T]erminal send [L]ine' },
     { '<leader>to', '<cmd>ToggleTermSendVisualSelection<CR>', mode = 'v', desc = '[T]erminal send selecti[O]n' },
+    { '<leader>tb', function() _G.toggleterm_toggle_winbar() end, desc = '[T]erminal toggle [B]ar (roster)' },
   },
   opts = {
     -- <C-\> is bound in the keys table above so it creates a terminal on first
@@ -53,15 +54,124 @@ return {
     end,
     float_opts = {
       border = 'curved',
+      -- the winbar eats one row inside the float, so ask for one extra to keep
+      -- the usable height toggleterm would otherwise pick (ui.lua:278)
+      height = function()
+        return math.ceil(math.min(vim.o.lines, math.max(20, vim.o.lines - 10))) + 1
+      end,
+    },
+    -- persistent roster of every terminal, drawn in each terminal's own window
+    winbar = {
+      enabled = true,
+      -- ui.winbar wraps each entry in WinBarActive/WinBarInactive by id only, so
+      -- dim closed-but-alive terminals here with an explicit group of our own
+      name_formatter = function(term)
+        local label = string.format('%d:%s', term.id, term:_display_name())
+        if term:is_open() then
+          return label
+        end
+        return '%#ToggleTermWinBarClosed#' .. label .. '%*'
+      end,
     },
     -- match nvim background, shade non-float terminals slightly darker
     shade_terminals = true,
     start_in_insert = true,
     persist_size = true,
     persist_mode = true,
+    -- every terminal's bar lists all terminals, so any open/close has to
+    -- refresh the others. winbar re-evaluates on redraw, so one redrawstatus
+    -- covers all windows -- no per-window loop needed.
+    on_open = function(term)
+      _G.toggleterm_apply_winbar(term)
+      vim.cmd.redrawstatus { bang = true }
+    end,
+    -- on_close runs *before* ui.close, so is_open() is still true here;
+    -- defer past the actual close for the dimming to be correct
+    on_close = function()
+      vim.schedule(function()
+        vim.cmd.redrawstatus { bang = true }
+      end)
+    end,
+    on_exit = function()
+      vim.schedule(function()
+        vim.cmd.redrawstatus { bang = true }
+      end)
+    end,
   },
   config = function(_, opts)
     require('toggleterm').setup(opts)
+
+    -- dim group for terminals that exist but are closed (see name_formatter)
+    local function set_roster_hl()
+      vim.api.nvim_set_hl(0, 'ToggleTermWinBarClosed', { link = 'Comment', default = true })
+    end
+    set_roster_hl()
+    vim.api.nvim_create_autocmd('ColorScheme', { callback = set_roster_hl })
+
+    -- Force the roster bar onto a terminal window, bypassing ui.set_winbar's
+    -- `term:is_float()` early-return (ui.lua:99). That guard exists for
+    -- neovim#19464 (winbar broke float borders), fixed in nvim 0.11.
+    --
+    -- Called from on_open rather than relying on toggleterm's TermOpen autocmd:
+    -- TermOpen only fires on terminal *buffer* creation, and reopening a float
+    -- reuses the buffer while building a fresh window -- which loses the
+    -- window-local winbar.
+    _G.toggleterm_apply_winbar = function(term)
+      if not (term and term.window and vim.api.nvim_win_is_valid(term.window)) then
+        return
+      end
+      local conf = require('toggleterm.config').get()
+      if not (conf.winbar and conf.winbar.enabled) then
+        return
+      end
+      -- the %{%...%} form (not %{...}) re-parses the result as statusline
+      -- format, which is what makes the %#hl# groups and %N@fn@ click regions
+      -- live rather than literal text
+      local value = ('%%{%%v:lua.require("toggleterm.ui").winbar(%d)%%}'):format(term.id)
+      vim.api.nvim_set_option_value('winbar', value, { scope = 'local', win = term.window })
+
+      -- ui.hl_term filters float winhighlight down to FloatBorder/NormalFloat
+      -- and overwrites the whole option (ui.lua:127), dropping the WinBar
+      -- mapping on every float open. Re-append it so the bar stays shaded.
+      local ok, wh = pcall(vim.api.nvim_get_option_value, 'winhighlight', { scope = 'local', win = term.window })
+      if ok and not wh:match 'WinBar' then
+        local prefix = wh ~= '' and (wh .. ',') or ''
+        pcall(vim.api.nvim_set_option_value, 'winhighlight', prefix .. 'WinBar:WinBar,WinBarNC:WinBarNC', {
+          scope = 'local',
+          win = term.window,
+        })
+      end
+    end
+
+    -- re-apply across every open terminal (resize, toggle-on)
+    local function refresh_all_winbars()
+      for _, t in ipairs(require('toggleterm.terminal').get_all(true)) do
+        if t:is_open() then
+          _G.toggleterm_apply_winbar(t)
+        end
+      end
+      vim.cmd.redrawstatus { bang = true }
+    end
+
+    -- flip the roster off/on for when the row is unwanted
+    _G.toggleterm_toggle_winbar = function()
+      local conf = require('toggleterm.config').get()
+      conf.winbar.enabled = not conf.winbar.enabled
+      if conf.winbar.enabled then
+        refresh_all_winbars()
+      else
+        for _, t in ipairs(require('toggleterm.terminal').get_all(true)) do
+          if t:is_open() and t.window and vim.api.nvim_win_is_valid(t.window) then
+            vim.api.nvim_set_option_value('winbar', '', { scope = 'local', win = t.window })
+          end
+        end
+        vim.cmd.redrawstatus { bang = true }
+      end
+      vim.notify('Terminal roster bar ' .. (conf.winbar.enabled and 'on' or 'off'))
+    end
+
+    -- update_float (resize) calls nvim_win_set_config without re-setting winbar
+    vim.api.nvim_create_autocmd('VimResized', { callback = refresh_all_winbars })
 
     -- resolve the currently focused terminal (falls back to last focused)
     local function focused_term()
@@ -170,6 +280,9 @@ return {
     local function set_terminal_keymaps()
       local o = { buffer = 0 }
       vim.keymap.set('t', '<esc>', [[<C-\><C-n>]], o)
+      -- <esc> above is swallowed by nvim, so TUIs that want it (claude code)
+      -- never see one. <C-q> forwards a literal escape byte to the job instead.
+      vim.keymap.set('t', '<C-q>', '<esc>', vim.tbl_extend('error', o, { remap = false, desc = 'Send raw <esc> to terminal' }))
       vim.keymap.set('t', '<C-h>', [[<Cmd>wincmd h<CR>]], o)
       vim.keymap.set('t', '<C-j>', [[<Cmd>wincmd j<CR>]], o)
       vim.keymap.set('t', '<C-k>', [[<Cmd>wincmd k<CR>]], o)
