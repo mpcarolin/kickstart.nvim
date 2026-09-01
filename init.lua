@@ -863,7 +863,9 @@ require('lazy').setup({
         --    https://github.com/pmizio/typescript-tools.nvim
         --
         -- But for many setups, the LSP (`ts_ls`) will work just fine
-        ts_ls = {},
+        -- single_file_support = false keeps ts_ls out of loose .ts files (incl. Deno
+        -- projects); it only attaches when a package.json project root is found.
+        ts_ls = { single_file_support = false },
         --
 
         lua_ls = {
@@ -1178,7 +1180,9 @@ require('lazy').setup({
     version = '*', -- stable branch
     event = 'VeryLazy',
     config = function()
-      require('mini.cmdline').setup()
+      require('mini.cmdline').setup {
+        autocorrect = { enable = false },
+      }
     end,
   },
   { -- Highlight, edit, and navigate code
