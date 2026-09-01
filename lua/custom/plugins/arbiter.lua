@@ -12,10 +12,22 @@
 --
 -- Git integration is built specifically against vim-fugitive (tpope/vim-fugitive):
 -- the diff-position parser keys off `&filetype == 'git'`, and commit SHA
--- resolution uses `FugitiveParse()` and `FugitiveGitDir()`. Other git plugins
--- (gitsigns, diffview, neogit) are not supported for the diff-mapping path;
--- in those buffers arbiter falls back to the regular-buffer behavior
--- (filename + raw line numbers, no commit SHA).
+-- resolution uses `FugitiveParse()` and `FugitiveGitDir()`.
+--
+-- diffview.nvim file-history diffs are also supported, but only on the
+-- RIGHT (new) side: a comment there is recorded AGAINST THE VIEWED COMMIT.
+-- The right side holds the full file blob at that commit, so the cursor's line
+-- number IS the commit-blob line number — no diff parsing needed. The note is
+-- written with commit-relative line_start/line_end, commit = the entry's SHA,
+-- and an anchor captured from the commit blob (so it matches those line
+-- numbers). The AI side must read the file at that commit (git show
+-- <commit>:<path>), not the working tree. nvim signs relocate best-effort into
+-- the working-tree buffer via the anchor (existing drift handling): the stored
+-- record stays commit-relative; only the on-screen sign moves. Commenting on
+-- the LEFT (old) side is rejected with an error. Other git plugins (gitsigns,
+-- neogit) are not supported for the diff-mapping path; in those buffers
+-- arbiter falls back to the regular-buffer behavior (filename + raw line
+-- numbers, no commit SHA).
 --
 -- Each record carries a `branch` field (resolved at write-time). On detached
 -- HEAD the short SHA is stored as the branch. Commands:
@@ -340,6 +352,47 @@ return {
       end
     end
 
+    -- Fugitive fires FugitiveChanged from many places, and one user action
+    -- (rebase, checkout, reset) fires it several times in a row. Coalesce a
+    -- burst into a single refresh so the fan-out runs once, not once per
+    -- event. Visible buffers refresh immediately so the window you are
+    -- looking at is never stale; the rest follow on the trailing edge.
+    local refresh_timer = nil
+    local REFRESH_DEBOUNCE_MS = 150
+
+    local function refresh_visible_buffers()
+      local seen = {}
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local bufnr = vim.api.nvim_win_get_buf(win)
+        if not seen[bufnr] then
+          seen[bufnr] = true
+          refresh_diagnostics_for_buf(bufnr)
+        end
+      end
+    end
+
+    local function refresh_all_debounced()
+      refresh_visible_buffers()
+      if refresh_timer then
+        refresh_timer:stop()
+        refresh_timer:close()
+        refresh_timer = nil
+      end
+      refresh_timer = vim.uv.new_timer()
+      refresh_timer:start(
+        REFRESH_DEBOUNCE_MS,
+        0,
+        vim.schedule_wrap(function()
+          if refresh_timer then
+            refresh_timer:stop()
+            refresh_timer:close()
+            refresh_timer = nil
+          end
+          refresh_all_listed_buffers()
+        end)
+      )
+    end
+
     -- Resolve a fugitive buffer's rev to a short SHA.
     -- FugitiveParse returns {rev, repo}. The rev can be:
     --   "abc1234def..." (full SHA, from :Git show <sha>)
@@ -446,6 +499,93 @@ return {
         line_start = mapped_start,
         line_end = mapped_end or mapped_start,
         deletions_only = false,
+      }
+    end
+
+    -- Detect whether the cursor sits in a diffview.nvim file-history diff and,
+    -- if so, extract the context needed to record a comment against the viewed
+    -- commit. The right-side buffer holds the full file blob at that commit, so
+    -- diff_buf_lines + sel_start/sel_end are already commit-blob coordinates.
+    -- Returns one of:
+    --   nil    — not a diffview diff buffer; caller falls through to existing logic
+    --   false  — diffview detected but rejected (left/old side, or no file); the
+    --            caller should return (an error toast has already fired)
+    --   table  — { repo_root, source_path (repo-relative), commit (12-char SHA
+    --             of the entry, or nil), diff_buf_lines, sel_start, sel_end }
+    --             for the right/new side
+    local function diffview_context(bufnr, start_line, end_line)
+      local ok_lib, lib = pcall(require, 'diffview.lib')
+      if not ok_lib then
+        return nil
+      end
+      local view = lib.get_current_view()
+      if not view then
+        return nil
+      end
+      local entry = view.cur_entry
+      if not entry or not entry.layout then
+        return nil
+      end
+
+      -- Identify which window/File the cursor is in via vcs.File.symbol
+      -- ("a" = old/left, "b" = new/right), matching f.bufnr to the cursor's buf.
+      local cur_buf = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+      local side = nil
+      local ok_files, files = pcall(function()
+        return entry.layout:files()
+      end)
+      if not ok_files or type(files) ~= 'table' then
+        return nil
+      end
+      for _, f in ipairs(files) do
+        if f.bufnr == cur_buf then
+          side = f.symbol
+        end
+      end
+      if side == nil then
+        return nil -- cursor not in a diff window
+      end
+      if side ~= 'b' then
+        vim.notify('arbiter: comment on the right (new) side of the diff', vim.log.levels.ERROR)
+        return false
+      end
+
+      local repo_root = entry.adapter and entry.adapter.ctx and entry.adapter.ctx.toplevel
+      local source_path = entry.path
+      if not repo_root or not source_path or source_path == '' then
+        vim.notify('arbiter: could not resolve diffview source path', vim.log.levels.ERROR)
+        return false
+      end
+
+      -- The file-history entry's commit SHA, truncated to 12 chars to match the
+      -- fugitive path (fugitive_commit_sha). diffview stores it a few ways
+      -- depending on version: entry.commit is usually a Commit object with a
+      -- `.hash` string, but can be a bare string; the b-side Rev (entry.revs.b)
+      -- carries the SHA in `.commit` as a final fallback.
+      local function extract_sha(e)
+        local c = e.commit
+        if type(c) == 'string' and c:match '^[0-9a-fA-F]+$' then
+          return c
+        end
+        if type(c) == 'table' and type(c.hash) == 'string' and c.hash:match '^[0-9a-fA-F]+$' then
+          return c.hash
+        end
+        local b = e.revs and e.revs.b
+        if type(b) == 'table' and type(b.commit) == 'string' and b.commit:match '^[0-9a-fA-F]+$' then
+          return b.commit
+        end
+        return nil
+      end
+      local sha = extract_sha(entry)
+      local commit = sha and sha:sub(1, 12) or nil
+
+      return {
+        repo_root = repo_root,
+        source_path = source_path,
+        commit = commit,
+        diff_buf_lines = vim.api.nvim_buf_get_lines(cur_buf, 0, -1, false),
+        sel_start = start_line,
+        sel_end = end_line,
       }
     end
 
@@ -652,7 +792,31 @@ return {
       local commit = nil
       local deletions_only = false
 
-      if is_fugitive_diff then
+      -- diffview.nvim file-history diff: record the comment AGAINST THE VIEWED
+      -- COMMIT. Checked before the fugitive branch so a diffview buffer (whose
+      -- filetype is the file's real language, not 'git') is never mistaken for
+      -- a regular buffer. The right-side buffer holds the full blob at that
+      -- commit, so the selection's line numbers are already commit-relative —
+      -- no mapping needed. When this is set, the anchor is captured from
+      -- `dv.diff_buf_lines` (the commit blob) so it matches those line numbers.
+      local dv_blob_lines = nil
+
+      local dv = diffview_context(bufnr, start_line, end_line)
+      if dv == false then
+        return -- diffview detected but rejected (left side / no file)
+      end
+
+      if dv then
+        repo_root = dv.repo_root
+        local _, gd = find_git_root_for(repo_root .. '/' .. dv.source_path)
+        git_dir = gd or select(1, core.find_git_root(repo_root))
+        file_path = dv.source_path
+        -- The diff buffer IS the commit blob; line numbers are commit-relative.
+        line_start = start_line
+        line_end = end_line
+        commit = dv.commit
+        dv_blob_lines = dv.diff_buf_lines
+      elseif is_fugitive_diff then
         local pos = parse_diff_position(bufnr, start_line, end_line)
         if not pos then
           vim.notify('arbiter: could not locate diff header / hunk for selection', vim.log.levels.ERROR)
@@ -699,12 +863,18 @@ return {
       local jsonl_path = core.resolve_jsonl_path(git_dir)
       local branch = core.current_branch(git_dir)
 
-      -- Capture an anchor against the source buffer's current contents. For a
-      -- fugitive diff, source_bufnr is still the diff buffer — we can't read
-      -- the post-image of the file from it directly, so skip anchor capture in
-      -- that case (the note still works; it just behaves like a legacy note).
+      -- Capture an anchor against the lines the record's coordinates point at.
+      -- For a diffview diff, capture from the commit blob at the commit-relative
+      -- range so the stored anchor matches the line numbers (and the commit).
+      -- nvim signs relocate it into the working tree best-effort via
+      -- resolve_anchor. For a fugitive diff, source_bufnr is still the diff
+      -- buffer — we can't read the post-image of the file from it directly, so
+      -- skip anchor capture in that case (the note still works; it just behaves
+      -- like a legacy note).
       local anchor
-      if not is_fugitive_diff and vim.api.nvim_buf_is_valid(source_bufnr) then
+      if dv_blob_lines then
+        anchor = core.build_anchor(dv_blob_lines, line_start, line_end)
+      elseif not is_fugitive_diff and vim.api.nvim_buf_is_valid(source_bufnr) then
         local buf_lines = vim.api.nvim_buf_get_lines(source_bufnr, 0, -1, false)
         anchor = core.build_anchor(buf_lines, line_start, line_end)
       end
@@ -741,21 +911,46 @@ return {
       local bufnr = vim.api.nvim_get_current_buf()
       local source_bufnr = bufnr
       local bufname = vim.api.nvim_buf_get_name(bufnr)
-      if bufname == '' then
-        vim.notify('arbiter: buffer has no filename', vim.log.levels.ERROR)
+
+      local repo_root, git_dir
+      local file_path
+      local commit = nil
+
+      -- diffview.nvim file-history diff: record a file-level note against the
+      -- viewed commit (provenance only — no line range). Right side only;
+      -- the left side is rejected by diffview_context.
+      local cur_line = vim.fn.line '.'
+      local dv = diffview_context(bufnr, cur_line, cur_line)
+      if dv == false then
         return
       end
-      if vim.bo[bufnr].filetype == 'git' then
-        vim.notify('arbiter: file-level notes are not supported on fugitive diff buffers', vim.log.levels.ERROR)
-        return
+      if dv then
+        repo_root = dv.repo_root
+        local _, gd = find_git_root_for(repo_root .. '/' .. dv.source_path)
+        git_dir = gd or select(1, core.find_git_root(repo_root))
+        file_path = dv.source_path
+        commit = dv.commit
+        if not git_dir then
+          vim.notify('arbiter: not inside a git repo', vim.log.levels.ERROR)
+          return
+        end
+      else
+        if bufname == '' then
+          vim.notify('arbiter: buffer has no filename', vim.log.levels.ERROR)
+          return
+        end
+        if vim.bo[bufnr].filetype == 'git' then
+          vim.notify('arbiter: file-level notes are not supported on fugitive diff buffers', vim.log.levels.ERROR)
+          return
+        end
+        repo_root, git_dir = find_git_root_for(bufname)
+        if not repo_root or not git_dir then
+          vim.notify('arbiter: not inside a git repo', vim.log.levels.ERROR)
+          return
+        end
+        local abs = vim.fn.fnamemodify(bufname, ':p')
+        file_path = repo_relpath(repo_root, abs) or abs
       end
-      local repo_root, git_dir = find_git_root_for(bufname)
-      if not repo_root or not git_dir then
-        vim.notify('arbiter: not inside a git repo', vim.log.levels.ERROR)
-        return
-      end
-      local abs = vim.fn.fnamemodify(bufname, ':p')
-      local file_path = repo_relpath(repo_root, abs) or abs
       local jsonl_path = core.resolve_jsonl_path(git_dir)
       local branch = core.current_branch(git_dir)
 
@@ -768,6 +963,7 @@ return {
           line_end = nil,
           note = note,
           branch = branch,
+          commit = commit,
           author = 'human',
         }
         if not record then
@@ -1833,7 +2029,7 @@ return {
       group = diag_group,
       pattern = 'FugitiveChanged',
       callback = function()
-        refresh_all_listed_buffers()
+        refresh_all_debounced()
       end,
     })
 
