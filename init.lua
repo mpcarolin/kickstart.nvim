@@ -1173,12 +1173,15 @@ require('lazy').setup({
       --  Check out: https://github.com/echasnovski/mini.nvim
     end,
   },
-  { -- Command-line enhancements (autocomplete, autocorrect, autopeek)
+  { -- Command-line enhancements (autocorrect, autopeek)
     'nvim-mini/mini.cmdline',
     version = '*', -- stable branch
     event = 'VeryLazy',
     config = function()
-      require('mini.cmdline').setup()
+      require('mini.cmdline').setup {
+        -- Autocomplete popup while typing after `:` adds noticeable lag; use <Tab> instead.
+        autocomplete = { enable = false },
+      }
     end,
   },
   { -- Highlight, edit, and navigate code
