@@ -330,9 +330,9 @@ require('lazy').setup({
       spec = {
         { '<leader>s', group = '[S]earch' },
         { '<leader>t', group = '[T]oggle' },
-        { '<leader>k', group = '[K]heckmate / Todo' },
         { '<leader>h', group = 'Git [H]unk', mode = { 'n', 'v' } },
         { '<leader>n', desc = '[N]otes tree' },
+        { '<leader>o', group = '[O]bsidian' },
       },
     },
   },
