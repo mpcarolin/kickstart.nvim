@@ -330,9 +330,9 @@ require('lazy').setup({
       spec = {
         { '<leader>s', group = '[S]earch' },
         { '<leader>t', group = '[T]oggle' },
-        { '<leader>k', group = '[K]heckmate / Todo' },
         { '<leader>h', group = 'Git [H]unk', mode = { 'n', 'v' } },
         { '<leader>n', desc = '[N]otes tree' },
+        { '<leader>o', group = '[O]bsidian' },
       },
     },
   },
@@ -1083,29 +1083,6 @@ require('lazy').setup({
     },
   },
 
-  { -- You can easily change to a different colorscheme.
-    -- Change the name of the colorscheme plugin below, and then
-    -- change the command in the config to whatever the name of that colorscheme is.
-    --
-    -- If you want to see what colorschemes are already installed, you can use `:Telescope colorscheme`.
-    'folke/tokyonight.nvim',
-    priority = 1000, -- Make sure to load this before all the other start plugins.
-    config = function()
-      ---@diagnostic disable-next-line: missing-fields
-      require('tokyonight').setup {
-        styles = {
-          comments = { italic = false }, -- Disable italics in comments
-        },
-      }
-
-      -- Load the colorscheme here.
-      -- Like many other themes, this one has different styles, and you could load
-      -- any other, such as 'tokyonight-storm', 'tokyonight-moon', or 'tokyonight-day'.
-      -- vim.cmd.colorscheme 'tokyonight-moon'
-      vim.cmd.colorscheme 'everforest'
-    end,
-  },
-
   -- Highlight todo, notes, etc in comments
   { 'folke/todo-comments.nvim', event = 'VimEnter', dependencies = { 'nvim-lua/plenary.nvim' }, opts = { signs = false } },
 
@@ -1175,12 +1152,14 @@ require('lazy').setup({
       --  Check out: https://github.com/echasnovski/mini.nvim
     end,
   },
-  { -- Command-line enhancements (autocomplete, autocorrect, autopeek)
+  { -- Command-line enhancements (autocorrect, autopeek)
     'nvim-mini/mini.cmdline',
     version = '*', -- stable branch
     event = 'VeryLazy',
     config = function()
       require('mini.cmdline').setup {
+        -- Autocomplete popup while typing after `:` adds noticeable lag; use <Tab> instead.
+        autocomplete = { enable = false },
         autocorrect = { enable = false },
       }
     end,
