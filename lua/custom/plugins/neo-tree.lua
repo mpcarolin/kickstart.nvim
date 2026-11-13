@@ -14,6 +14,11 @@ return {
   ---@module "neo-tree"
   ---@type neotree.Config?
   opts = {
+    window = {
+      mappings = {
+        ['P'] = { 'toggle_preview', config = { use_float = false, use_image_nvim = true } },
+      },
+    },
     sources = {
       'filesystem',
       'buffers',
